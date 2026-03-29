@@ -4,5 +4,12 @@ import runpy
 import sys
 
 SCRIPT = Path(__file__).resolve().parent / 'tools' / 'source_slot_mapper_gui.py'
-sys.argv[0] = str(SCRIPT)
-runpy.run_path(str(SCRIPT), run_name='__main__')
+
+
+def main() -> None:
+    sys.argv[0] = str(SCRIPT)
+    runpy.run_path(str(SCRIPT), run_name='__main__')
+
+
+if __name__ == "__main__":
+    main()

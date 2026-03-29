@@ -41,13 +41,57 @@ from slot_definitions import (
 from windows_cursor_tool import sanitize_path_component
 
 
-REPO_ROOT = SCRIPT_DIR.parent.parent
+REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_WORK_ROOT = REPO_ROOT / "gui-builds"
+DEFAULT_GUI_PALETTE_PATH = REPO_ROOT / "gui-palette.json"
 CARD_PREVIEW_SIZE = 48
 PLAYER_PREVIEW_SIZE = 132
 CANDIDATE_PREVIEW_SIZE = 96
 CANVAS_SLOT_GLYPH_SIZE = 28
 LOW_CONFIDENCE_LABELS = {"likely blurry", "redraw recommended"}
+HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})$")
+DEFAULT_GUI_PALETTE = {
+    "root_bg": "#2a2e32",
+    "panel_bg": "#31363b",
+    "content_bg": "#1b1e20",
+    "text": "#fcfcfc",
+    "heading_text": "#fcfcfc",
+    "muted_text": "#a1a9b1",
+    "path_text": "#a1a9b1",
+    "accent": "#3daee9",
+    "accent_fg": "#fcfcfc",
+    "border": "#5f6265",
+    "warning": "#f67400",
+    "error": "#da4453",
+    "success": "#27ae60",
+    "selection_bg": "#3daee9",
+    "selection_text": "#fcfcfc",
+    "preview_bg": "#1b1e20",
+    "preview_border": "#5f6265",
+    "preview_placeholder": "#7a7f86",
+    "preview_counter_text": "#a1a9b1",
+    "card_bg": "#31363b",
+    "card_selected_bg": "#3daee9",
+    "card_text": "#fcfcfc",
+    "card_muted_text": "#a1a9b1",
+    "card_warning_text": "#f67400",
+    "button_bg": "#31363b",
+    "button_fg": "#fcfcfc",
+    "entry_bg": "#1b1e20",
+    "entry_fg": "#fcfcfc",
+    "tree_bg": "#1b1e20",
+    "tree_fg": "#fcfcfc",
+    "tree_selected_bg": "#3daee9",
+    "tree_selected_fg": "#fcfcfc",
+    "glyph_fg": "#fcfcfc",
+    "glyph_accent": "#3daee9",
+    "status_text": "#fcfcfc",
+}
+PALETTE_ALIASES = {
+    "app_bg": "root_bg",
+    "surface": "panel_bg",
+    "accent_text": "accent_fg",
+}
 
 
 def build_payload(
@@ -93,6 +137,94 @@ def package_theme(theme_dir: Path, tar_path: Path) -> Path:
     with tarfile.open(tar_path, "w:gz") as archive:
         archive.add(theme_dir, arcname=theme_dir.name)
     return tar_path
+
+
+def _normalize_hex_color(value: str) -> str | None:
+    value = value.strip()
+    if not HEX_COLOR_RE.match(value):
+        return None
+    if len(value) == 4:
+        return "#" + "".join(ch * 2 for ch in value[1:])
+    return value.lower()
+
+
+def resolve_palette_path(explicit_path: Path | None = None) -> Path | None:
+    if explicit_path is not None:
+        return explicit_path.expanduser().resolve()
+    if DEFAULT_GUI_PALETTE_PATH.exists():
+        return DEFAULT_GUI_PALETTE_PATH.resolve()
+    return None
+
+
+def load_gui_palette(palette_path: Path | None = None) -> tuple[dict[str, str], Path | None, str]:
+    resolved_path = resolve_palette_path(palette_path)
+    palette = dict(DEFAULT_GUI_PALETTE)
+    if resolved_path is None or not resolved_path.exists():
+        return palette, None, "built-in"
+
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"GUI palette file must contain a JSON object: {resolved_path}")
+
+    palette_name = str(payload.get("name", resolved_path.stem))
+    provided_keys = set()
+    for raw_key, raw_value in payload.items():
+        if raw_key == "name":
+            continue
+        key = PALETTE_ALIASES.get(raw_key, raw_key)
+        if key not in palette:
+            continue
+        normalized = _normalize_hex_color(str(raw_value))
+        if normalized is None:
+            raise ValueError(f"invalid GUI palette color for {raw_key!r}: {raw_value!r}")
+        palette[key] = normalized
+        provided_keys.add(key)
+
+    if "card_bg" not in provided_keys:
+        palette["card_bg"] = palette["panel_bg"]
+    if "card_selected_bg" not in provided_keys:
+        palette["card_selected_bg"] = palette["selection_bg"]
+    if "button_bg" not in provided_keys:
+        palette["button_bg"] = palette["panel_bg"]
+    if "button_fg" not in provided_keys:
+        palette["button_fg"] = palette["text"]
+    if "entry_bg" not in provided_keys:
+        palette["entry_bg"] = palette["content_bg"]
+    if "entry_fg" not in provided_keys:
+        palette["entry_fg"] = palette["text"]
+    if "tree_bg" not in provided_keys:
+        palette["tree_bg"] = palette["content_bg"]
+    if "tree_fg" not in provided_keys:
+        palette["tree_fg"] = palette["text"]
+    if "tree_selected_bg" not in provided_keys:
+        palette["tree_selected_bg"] = palette["selection_bg"]
+    if "tree_selected_fg" not in provided_keys:
+        palette["tree_selected_fg"] = palette["selection_text"]
+    if "preview_bg" not in provided_keys:
+        palette["preview_bg"] = palette["content_bg"]
+    if "preview_border" not in provided_keys:
+        palette["preview_border"] = palette["border"]
+    if "preview_placeholder" not in provided_keys:
+        palette["preview_placeholder"] = palette["muted_text"]
+    if "preview_counter_text" not in provided_keys:
+        palette["preview_counter_text"] = palette["path_text"]
+    if "heading_text" not in provided_keys:
+        palette["heading_text"] = palette["text"]
+    if "path_text" not in provided_keys:
+        palette["path_text"] = palette["muted_text"]
+    if "card_text" not in provided_keys:
+        palette["card_text"] = palette["heading_text"]
+    if "card_muted_text" not in provided_keys:
+        palette["card_muted_text"] = palette["path_text"]
+    if "card_warning_text" not in provided_keys:
+        palette["card_warning_text"] = palette["warning"]
+    if "glyph_fg" not in provided_keys:
+        palette["glyph_fg"] = palette["heading_text"]
+    if "glyph_accent" not in provided_keys:
+        palette["glyph_accent"] = palette["accent"]
+    if "status_text" not in provided_keys:
+        palette["status_text"] = palette["text"]
+    return palette, resolved_path, palette_name
 
 
 def find_image_tool() -> str:
@@ -291,8 +423,9 @@ def infer_slot_warnings(slot_key: str, summary: dict, target_sizes: list[int], p
 
 
 class AnimationPreviewPanel(ttk.LabelFrame):
-    def __init__(self, master: tk.Widget, title: str, canvas_size: int):
+    def __init__(self, master: tk.Widget, title: str, canvas_size: int, palette: dict[str, str]):
         super().__init__(master, text=title, padding=8)
+        self.palette = palette
         self.canvas_size = canvas_size
         self.frames: list[dict] = []
         self.frame_images: list[tk.PhotoImage] = []
@@ -307,9 +440,9 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             self,
             width=canvas_size,
             height=canvas_size,
-            bg="#ffffff",
+            bg=self.palette["preview_bg"],
             highlightthickness=1,
-            highlightbackground="#c6ccd2",
+            highlightbackground=self.palette["preview_border"],
         )
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
@@ -371,7 +504,7 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             self.canvas_size // 2,
             self.canvas_size // 2,
             text="--",
-            fill="#7a7f86",
+            fill=self.palette["preview_placeholder"],
             font=("TkDefaultFont", 14, "bold"),
         )
         self.summary_var.set(reason)
@@ -405,7 +538,7 @@ class AnimationPreviewPanel(ttk.LabelFrame):
             8,
             self.canvas_size - 8,
             anchor="sw",
-            fill="#4d535a",
+            fill=self.palette["preview_counter_text"],
             text=f"{self.current_index + 1}/{len(self.frame_images)}",
         )
 
@@ -458,9 +591,10 @@ class AnimationPreviewPanel(ttk.LabelFrame):
 
 class SlotCard(tk.Frame):
     def __init__(self, master: tk.Widget, slot: dict, app: "MappingApp"):
-        super().__init__(master, bd=1, relief="solid", bg="#eef2f5", padx=8, pady=8)
+        super().__init__(master, bd=1, relief="solid", bg=app.palette["card_bg"], padx=8, pady=8)
         self.slot = slot
         self.app = app
+        self.palette = app.palette
         self.preview_image: tk.PhotoImage | None = None
 
         self.grid_columnconfigure(1, weight=1)
@@ -470,35 +604,47 @@ class SlotCard(tk.Frame):
             width=CANVAS_SLOT_GLYPH_SIZE,
             height=CANVAS_SLOT_GLYPH_SIZE,
             highlightthickness=0,
-            bg="#eef2f5",
+            bg=self.palette["card_bg"],
         )
         self.glyph.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, 8))
-        draw_slot_glyph(self.glyph, slot["key"], bg="#eef2f5")
+        draw_slot_glyph(self.glyph, slot["key"], self.palette, bg=self.palette["card_bg"])
 
-        self.title_label = tk.Label(self, text=slot["label"], bg="#eef2f5", fg="#0f1720", font=("TkDefaultFont", 10, "bold"))
+        self.title_label = tk.Label(
+            self,
+            text=slot["label"],
+            bg=self.palette["card_bg"],
+            fg=self.palette["card_text"],
+            font=("TkDefaultFont", 10, "bold"),
+        )
         self.title_label.grid(row=0, column=1, sticky="w")
 
         self.preview_canvas = tk.Canvas(
             self,
             width=CARD_PREVIEW_SIZE,
             height=CARD_PREVIEW_SIZE,
-            bg="#ffffff",
+            bg=self.palette["preview_bg"],
             highlightthickness=1,
-            highlightbackground="#c6ccd2",
+            highlightbackground=self.palette["preview_border"],
         )
         self.preview_canvas.grid(row=0, column=2, rowspan=3, padx=(10, 0), sticky="ne")
 
-        self.file_label = tk.Label(self, text="Unassigned", bg="#eef2f5", fg="#2f3a45", anchor="w")
+        self.file_label = tk.Label(self, text="Unassigned", bg=self.palette["card_bg"], fg=self.palette["card_text"], anchor="w")
         self.file_label.grid(row=1, column=1, sticky="w")
 
-        self.badge_label = tk.Label(self, text="Assign a source to preview it", bg="#eef2f5", fg="#55606c", anchor="w")
+        self.badge_label = tk.Label(
+            self,
+            text="Assign a source to preview it",
+            bg=self.palette["card_bg"],
+            fg=self.palette["card_muted_text"],
+            anchor="w",
+        )
         self.badge_label.grid(row=2, column=1, sticky="w")
 
         self.path_label = tk.Label(
             self,
             text="",
-            bg="#eef2f5",
-            fg="#697582",
+            bg=self.palette["card_bg"],
+            fg=self.palette["card_muted_text"],
             anchor="w",
             justify="left",
             wraplength=520,
@@ -508,8 +654,8 @@ class SlotCard(tk.Frame):
         self.warning_label = tk.Label(
             self,
             text="",
-            bg="#eef2f5",
-            fg="#8b5a00",
+            bg=self.palette["card_bg"],
+            fg=self.palette["card_warning_text"],
             anchor="w",
             justify="left",
             wraplength=620,
@@ -532,17 +678,30 @@ class SlotCard(tk.Frame):
         self.update_card(None, None, None, False)
 
     def update_card(self, path: str | None, summary: dict | None, quality: dict | None, selected: bool) -> None:
-        bg = "#e7f3ff" if selected else "#eef2f5"
+        bg = self.palette["card_selected_bg"] if selected else self.palette["card_bg"]
+        fg = self.palette["selection_text"] if selected else self.palette["card_text"]
+        muted_fg = self.palette["selection_text"] if selected else self.palette["card_muted_text"]
+        warning_fg = self.palette["selection_text"] if selected else self.palette["card_warning_text"]
         for widget in (self, self.glyph, self.title_label, self.file_label, self.badge_label, self.path_label, self.warning_label):
             widget.configure(bg=bg)
-        draw_slot_glyph(self.glyph, self.slot["key"], bg=bg)
-        self.configure(highlightbackground="#5e8fd8" if selected else "#d0d7de", highlightthickness=1, bd=0)
+        self.title_label.configure(fg=fg)
+        self.file_label.configure(fg=fg)
+        self.badge_label.configure(fg=muted_fg)
+        self.path_label.configure(fg=muted_fg)
+        self.warning_label.configure(fg=warning_fg)
+        draw_slot_glyph(self.glyph, self.slot["key"], self.palette, bg=bg)
+        self.configure(highlightbackground=self.palette["selection_bg"] if selected else self.palette["border"], highlightthickness=1, bd=0)
 
         self.preview_canvas.delete("all")
         if self.preview_image is not None:
             self.preview_canvas.create_image(CARD_PREVIEW_SIZE // 2, CARD_PREVIEW_SIZE // 2, image=self.preview_image)
         else:
-            self.preview_canvas.create_text(CARD_PREVIEW_SIZE // 2, CARD_PREVIEW_SIZE // 2, text="--", fill="#7a7f86")
+            self.preview_canvas.create_text(
+                CARD_PREVIEW_SIZE // 2,
+                CARD_PREVIEW_SIZE // 2,
+                text="--",
+                fill=self.palette["preview_placeholder"],
+            )
 
         if not path or summary is None:
             self.file_label.configure(text="Unassigned")
@@ -559,11 +718,11 @@ class SlotCard(tk.Frame):
         self.warning_label.configure(text=warnings[0] if warnings else "")
 
 
-def draw_slot_glyph(canvas: tk.Canvas, slot_key: str, bg: str = "white") -> None:
+def draw_slot_glyph(canvas: tk.Canvas, slot_key: str, palette: dict[str, str], bg: str = "white") -> None:
     canvas.configure(bg=bg)
     canvas.delete("all")
-    color = "#2b2b2b"
-    accent = "#0f7b6c"
+    color = palette["glyph_fg"]
+    accent = palette["glyph_accent"]
 
     if slot_key == "default_pointer":
         canvas.create_polygon(6, 5, 6, 22, 11, 17, 14, 25, 17, 24, 14, 16, 21, 16, fill=accent, outline=color)
@@ -634,10 +793,12 @@ def draw_slot_glyph(canvas: tk.Canvas, slot_key: str, bg: str = "white") -> None
 
 
 class MappingApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, palette_path: Path | None = None):
         self.root = root
         self.root.title("win2kde Cursor Converter")
         self.root.geometry("1560x1040")
+        self.palette, self.palette_path, self.palette_name = load_gui_palette(palette_path)
+        self.style = ttk.Style(root)
 
         self.current_mapping_path: Path | None = None
         self.last_tar_path: Path | None = None
@@ -665,7 +826,11 @@ class MappingApp:
         self.preset_description_var = tk.StringVar(value=describe_build_preset(self.build_preset_var.get()))
         self.overall_quality_var = tk.StringVar(value="Overall quality forecast: --")
         self.last_output_var = tk.StringVar(value="No build output yet")
+        self.palette_name_var = tk.StringVar(
+            value=f"GUI palette: {self.palette_name} ({self.palette_path.name})" if self.palette_path else "GUI palette: built-in"
+        )
 
+        self._apply_palette()
         self._build_ui()
         self._refresh_all_views()
 
@@ -688,6 +853,7 @@ class MappingApp:
             header,
             text="Windows cursor pack -> Linux Xcursor theme",
             font=("", 13, "bold"),
+            style="Heading.TLabel",
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
@@ -697,7 +863,9 @@ class MappingApp:
             ),
             wraplength=1450,
             justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 10))
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 4))
+        ttk.Label(header, textvariable=self.palette_name_var, style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 10))
 
         self.notebook = ttk.Notebook(outer)
         self.notebook.grid(row=1, column=0, sticky="nsew")
@@ -716,8 +884,135 @@ class MappingApp:
         status_bar = ttk.Frame(outer)
         status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         status_bar.columnconfigure(1, weight=1)
-        ttk.Label(status_bar, textvariable=self.summary_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(status_bar, textvariable=self.summary_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+    def _apply_palette(self) -> None:
+        palette = self.palette
+        self.root.configure(bg=palette["root_bg"])
+        self.root.tk_setPalette(
+            background=palette["root_bg"],
+            foreground=palette["text"],
+            activeBackground=palette["selection_bg"],
+            activeForeground=palette["selection_text"],
+            highlightColor=palette["selection_bg"],
+            selectBackground=palette["selection_bg"],
+            selectForeground=palette["selection_text"],
+        )
+        option_pairs = {
+            "*Menu.background": palette["panel_bg"],
+            "*Menu.foreground": palette["text"],
+            "*Menu.activeBackground": palette["selection_bg"],
+            "*Menu.activeForeground": palette["selection_text"],
+            "*Menu.selectColor": palette["accent"],
+            "*Listbox.background": palette["entry_bg"],
+            "*Listbox.foreground": palette["entry_fg"],
+            "*Listbox.selectBackground": palette["selection_bg"],
+            "*Listbox.selectForeground": palette["selection_text"],
+            "*Listbox.highlightBackground": palette["border"],
+            "*Listbox.highlightColor": palette["selection_bg"],
+            "*Entry.background": palette["entry_bg"],
+            "*Entry.foreground": palette["entry_fg"],
+            "*Entry.insertBackground": palette["text"],
+            "*Text.background": palette["content_bg"],
+            "*Text.foreground": palette["text"],
+            "*Text.insertBackground": palette["text"],
+            "*Text.selectBackground": palette["selection_bg"],
+            "*Text.selectForeground": palette["selection_text"],
+            "*TCombobox*Listbox.background": palette["entry_bg"],
+            "*TCombobox*Listbox.foreground": palette["entry_fg"],
+            "*TCombobox*Listbox.selectBackground": palette["selection_bg"],
+            "*TCombobox*Listbox.selectForeground": palette["selection_text"],
+            "*TCombobox*Listbox.highlightBackground": palette["border"],
+            "*TCombobox*Listbox.highlightColor": palette["selection_bg"],
+            "*TCombobox*Listbox.font": "TkDefaultFont",
+            "*TCombobox*Listbox.relief": "flat",
+            "*TCombobox*Listbox.borderWidth": 0,
+            "*tearOff": 0,
+        }
+        for pattern, value in option_pairs.items():
+            self.root.option_add(pattern, value)
+
+        self.style.configure(".", background=palette["root_bg"], foreground=palette["text"])
+        self.style.configure("TFrame", background=palette["root_bg"])
+        self.style.configure("TLabel", background=palette["root_bg"], foreground=palette["text"])
+        self.style.configure("Heading.TLabel", background=palette["root_bg"], foreground=palette["heading_text"])
+        self.style.configure("Muted.TLabel", background=palette["root_bg"], foreground=palette["muted_text"])
+        self.style.configure("Warning.TLabel", background=palette["root_bg"], foreground=palette["warning"])
+        self.style.configure("Status.TLabel", background=palette["root_bg"], foreground=palette["status_text"])
+        self.style.configure("TLabelframe", background=palette["root_bg"], bordercolor=palette["border"])
+        self.style.configure("TLabelframe.Label", background=palette["root_bg"], foreground=palette["heading_text"])
+        self.style.configure("TButton", background=palette["button_bg"], foreground=palette["button_fg"], bordercolor=palette["border"])
+        self.style.map(
+            "TButton",
+            background=[("active", palette["selection_bg"]), ("pressed", palette["selection_bg"])],
+            foreground=[("active", palette["selection_text"]), ("pressed", palette["selection_text"])],
+        )
+        self.style.configure(
+            "TEntry",
+            fieldbackground=palette["entry_bg"],
+            foreground=palette["entry_fg"],
+            bordercolor=palette["border"],
+        )
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=palette["entry_bg"],
+            foreground=palette["entry_fg"],
+            background=palette["panel_bg"],
+            bordercolor=palette["border"],
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", palette["entry_bg"])],
+            foreground=[("readonly", palette["entry_fg"])],
+            selectbackground=[("readonly", palette["selection_bg"])],
+            selectforeground=[("readonly", palette["selection_text"])],
+        )
+        self.style.configure(
+            "Treeview",
+            background=palette["tree_bg"],
+            fieldbackground=palette["tree_bg"],
+            foreground=palette["tree_fg"],
+            bordercolor=palette["border"],
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", palette["tree_selected_bg"])],
+            foreground=[("selected", palette["tree_selected_fg"])],
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=palette["panel_bg"],
+            foreground=palette["heading_text"],
+            bordercolor=palette["border"],
+        )
+        self.style.map("Treeview.Heading", background=[("active", palette["card_selected_bg"])])
+        self.style.configure("TNotebook", background=palette["root_bg"], bordercolor=palette["border"])
+        self.style.configure(
+            "TNotebook.Tab",
+            background=palette["panel_bg"],
+            foreground=palette["text"],
+            bordercolor=palette["border"],
+        )
+        self.style.map(
+            "TNotebook.Tab",
+            background=[("selected", palette["card_selected_bg"])],
+            foreground=[("selected", palette["selection_text"])],
+        )
+
+    def _theme_text_widget(self, widget: tk.Text, *, bg_key: str = "content_bg", fg_key: str = "text") -> None:
+        widget.configure(
+            bg=self.palette[bg_key],
+            fg=self.palette[fg_key],
+            insertbackground=self.palette["text"],
+            selectbackground=self.palette["selection_bg"],
+            selectforeground=self.palette["selection_text"],
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+            highlightcolor=self.palette["selection_bg"],
+            relief="flat",
+            bd=0,
+        )
 
     def _build_analysis_tab(self) -> None:
         self.analysis_tab.columnconfigure(0, weight=1)
@@ -779,6 +1074,7 @@ class MappingApp:
         right.columnconfigure(0, weight=1)
         self.analysis_detail_text = tk.Text(right, height=8, wrap="word")
         self.analysis_detail_text.grid(row=0, column=0, sticky="nsew")
+        self._theme_text_widget(self.analysis_detail_text)
         set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
 
         assets_frame = ttk.LabelFrame(self.analysis_tab, text="Detected Source Assets", padding=10)
@@ -839,7 +1135,7 @@ class MappingApp:
         slot_frame.columnconfigure(0, weight=1)
         slot_frame.rowconfigure(0, weight=1)
 
-        slot_canvas = tk.Canvas(slot_frame, highlightthickness=0)
+        slot_canvas = tk.Canvas(slot_frame, highlightthickness=0, bg=self.palette["root_bg"])
         slot_canvas.grid(row=0, column=0, sticky="nsew")
         slot_scroll = ttk.Scrollbar(slot_frame, orient="vertical", command=slot_canvas.yview)
         slot_scroll.grid(row=0, column=1, sticky="ns")
@@ -866,7 +1162,7 @@ class MappingApp:
         self.selected_slot_title_var = tk.StringVar(value="Select a slot")
         self.selected_slot_meta_var = tk.StringVar(value="")
         self.selected_slot_path_var = tk.StringVar(value="")
-        ttk.Label(detail, textvariable=self.selected_slot_title_var, font=("", 11, "bold")).grid(
+        ttk.Label(detail, textvariable=self.selected_slot_title_var, font=("", 11, "bold"), style="Heading.TLabel").grid(
             row=0,
             column=0,
             sticky="w",
@@ -878,7 +1174,7 @@ class MappingApp:
             sticky="w",
             pady=(4, 0),
         )
-        ttk.Label(detail, textvariable=self.selected_slot_path_var, wraplength=800, justify="left", foreground="#55606c").grid(
+        ttk.Label(detail, textvariable=self.selected_slot_path_var, wraplength=800, justify="left", style="Muted.TLabel").grid(
             row=2,
             column=0,
             columnspan=2,
@@ -908,15 +1204,16 @@ class MappingApp:
         warning_frame.columnconfigure(0, weight=1)
         self.slot_warning_text = tk.Text(warning_frame, height=6, wrap="word")
         self.slot_warning_text.grid(row=0, column=0, sticky="nsew")
+        self._theme_text_widget(self.slot_warning_text)
         set_readonly_text(self.slot_warning_text, "Select a slot to inspect its warnings and quality forecast.")
 
         preview_row = ttk.Frame(right)
         preview_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         preview_row.columnconfigure(0, weight=1)
         preview_row.columnconfigure(1, weight=1)
-        self.source_preview_panel = AnimationPreviewPanel(preview_row, "Source Animation Preview", PLAYER_PREVIEW_SIZE)
+        self.source_preview_panel = AnimationPreviewPanel(preview_row, "Source Animation Preview", PLAYER_PREVIEW_SIZE, self.palette)
         self.source_preview_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.output_preview_panel = AnimationPreviewPanel(preview_row, "Predicted Linux Output Preview", PLAYER_PREVIEW_SIZE)
+        self.output_preview_panel = AnimationPreviewPanel(preview_row, "Predicted Linux Output Preview", PLAYER_PREVIEW_SIZE, self.palette)
         self.output_preview_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
         candidate_frame = ttk.LabelFrame(right, text="Ranked Candidate Browser", padding=10)
@@ -950,7 +1247,7 @@ class MappingApp:
         candidate_detail = ttk.Frame(candidate_frame)
         candidate_detail.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         candidate_detail.columnconfigure(1, weight=1)
-        self.candidate_preview_panel = AnimationPreviewPanel(candidate_detail, "Candidate Preview", CANDIDATE_PREVIEW_SIZE)
+        self.candidate_preview_panel = AnimationPreviewPanel(candidate_detail, "Candidate Preview", CANDIDATE_PREVIEW_SIZE, self.palette)
         self.candidate_preview_panel.grid(row=0, column=0, rowspan=2, sticky="nw")
         self.candidate_summary_var = tk.StringVar(value="Select a candidate to inspect it.")
         self.candidate_warning_var = tk.StringVar(value="")
@@ -965,7 +1262,7 @@ class MappingApp:
             textvariable=self.candidate_warning_var,
             wraplength=620,
             justify="left",
-            foreground="#8b5a00",
+            style="Warning.TLabel",
         ).grid(row=1, column=1, sticky="nw", padx=(10, 0), pady=(6, 0))
 
     def _build_build_tab(self) -> None:
@@ -988,7 +1285,7 @@ class MappingApp:
         )
         self.preset_combo.grid(row=0, column=1, sticky="w", pady=3)
         ttk.Button(top, text="Apply Preset", command=self.apply_selected_preset).grid(row=0, column=2, padx=(8, 0), pady=3)
-        ttk.Label(top, textvariable=self.preset_description_var, wraplength=760, justify="left").grid(
+        ttk.Label(top, textvariable=self.preset_description_var, wraplength=760, justify="left", style="Muted.TLabel").grid(
             row=0,
             column=3,
             columnspan=2,
@@ -1026,13 +1323,14 @@ class MappingApp:
         quality_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(10, 0))
         quality_frame.columnconfigure(0, weight=1)
         quality_frame.rowconfigure(1, weight=1)
-        ttk.Label(quality_frame, textvariable=self.overall_quality_var, font=("", 11, "bold")).grid(
+        ttk.Label(quality_frame, textvariable=self.overall_quality_var, font=("", 11, "bold"), style="Heading.TLabel").grid(
             row=0,
             column=0,
             sticky="w",
         )
         self.build_warning_text = tk.Text(quality_frame, wrap="word")
         self.build_warning_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self._theme_text_widget(self.build_warning_text)
         set_readonly_text(self.build_warning_text, "Warnings and build guidance will appear here.")
 
         export_frame = ttk.LabelFrame(self.build_tab, text="Mapping, Export, And Final Output", padding=10)
@@ -1049,7 +1347,8 @@ class MappingApp:
 
         self.build_summary_text = tk.Text(export_frame, wrap="word")
         self.build_summary_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        ttk.Label(export_frame, textvariable=self.last_output_var, wraplength=720, justify="left").grid(
+        self._theme_text_widget(self.build_summary_text)
+        ttk.Label(export_frame, textvariable=self.last_output_var, wraplength=720, justify="left", style="Muted.TLabel").grid(
             row=2,
             column=0,
             sticky="w",
@@ -1868,6 +2167,7 @@ class MappingApp:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--load", type=Path, help="preload a mapping JSON into the GUI")
+    parser.add_argument("--palette", type=Path, help="load a GUI palette JSON; defaults to gui-palette.json when present")
     parser.add_argument("--auto-close-ms", type=int, default=0, help="close automatically after N milliseconds")
     args = parser.parse_args(argv)
 
@@ -1875,7 +2175,7 @@ def main(argv: list[str] | None = None) -> None:
     style = ttk.Style(root)
     if "clam" in style.theme_names():
         style.theme_use("clam")
-    app = MappingApp(root)
+    app = MappingApp(root, palette_path=args.palette)
     app.preset_description_var.set(describe_build_preset(app.build_preset_var.get()))
 
     if args.load:

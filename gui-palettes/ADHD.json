@@ -1,0 +1,21 @@
+{
+  "name": "ADHD",
+  "app_bg": "#1b1f2d",
+  "panel_bg": "#1f2333",
+  "content_bg": "#10131b",
+  "border": "#2f3447",
+  "text": "#b7bcc8",
+  "heading_text": "#d7dce7",
+  "muted_text": "#717789",
+  "path_text": "#8a90a0",
+  "accent": "#00efd0",
+  "accent_text": "#081317",
+  "selection_bg": "#00efd0",
+  "selection_text": "#081317",
+  "warning": "#f0b24a",
+  "error": "#e05a6f",
+  "success": "#39d98a",
+  "preview_bg": "#171b28",
+  "card_bg": "#202536",
+  "card_selected_bg": "#8d00c5"
+}

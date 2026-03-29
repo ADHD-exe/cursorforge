@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a Linux Xcursor theme from the glitch Windows cursor set."""
+"""Shared Xcursor theme builder helpers and the legacy glitch-theme entrypoint."""
 
 from __future__ import annotations
 

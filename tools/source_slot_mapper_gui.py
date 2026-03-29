@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tkinter as tk
@@ -26,10 +28,13 @@ from slot_definitions import (
     SLOT_BY_KEY,
     SLOT_DEFS,
 )
+from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_WORK_ROOT = REPO_ROOT / "gui-builds"
+PREVIEW_SIZE = 28
+PREVIEW_BORDER = 32
 
 
 def build_payload(
@@ -74,6 +79,86 @@ def package_theme(theme_dir: Path, tar_path: Path) -> Path:
     with tarfile.open(tar_path, "w:gz") as archive:
         archive.add(theme_dir, arcname=theme_dir.name)
     return tar_path
+
+
+def find_image_tool() -> str:
+    for tool_name in ("magick", "convert"):
+        tool_path = shutil.which(tool_name)
+        if tool_path:
+            return tool_path
+    raise RuntimeError("ImageMagick is required but neither 'magick' nor 'convert' was found")
+
+
+def preview_extract_dir(preview_root: Path, source_path: Path) -> Path:
+    digest = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()[:8]
+    return preview_root / "_extracted" / f"{sanitize_path_component(source_path.stem)}-{digest}"
+
+
+def preview_png_from_json(source_path: Path) -> Path:
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    frames = payload.get("frames", [])
+    if not frames:
+        raise ValueError(f"metadata JSON contains no frames: {source_path}")
+
+    frame = frames[0]
+    if frame.get("entries"):
+        png_path = Path(frame["entries"][0]["png"])
+    elif frame.get("png"):
+        png_path = Path(frame["png"])
+    else:
+        raise ValueError(f"metadata JSON contains no previewable PNG path: {source_path}")
+
+    if not png_path.is_absolute():
+        png_path = (source_path.parent / png_path).resolve()
+    return png_path
+
+
+def resolve_preview_source_png(source_path: Path, preview_root: Path) -> Path:
+    suffix = source_path.suffix.lower()
+    if suffix == ".png":
+        return source_path.resolve()
+    if suffix == ".json":
+        return preview_png_from_json(source_path)
+
+    metadata = extract_asset(source_path, preview_extract_dir(preview_root, source_path))
+    frames = metadata.get("frames", [])
+    if not frames:
+        raise ValueError(f"no frames extracted from {source_path}")
+    entries = frames[0].get("entries", [])
+    if not entries:
+        raise ValueError(f"no entries extracted from {source_path}")
+    return Path(entries[0]["png"]).resolve()
+
+
+def render_preview_thumbnail(source_png: Path, preview_root: Path) -> Path:
+    preview_root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        f"{source_png.resolve()}::{source_png.stat().st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:12]
+    preview_png = preview_root / f"{sanitize_path_component(source_png.stem)}_{digest}_{PREVIEW_SIZE}.png"
+    if preview_png.exists():
+        return preview_png
+
+    image_tool = find_image_tool()
+    subprocess.run(
+        [
+            image_tool,
+            str(source_png),
+            "-background",
+            "none",
+            "-gravity",
+            "center",
+            "-resize",
+            f"{PREVIEW_SIZE}x{PREVIEW_SIZE}",
+            "-extent",
+            f"{PREVIEW_SIZE}x{PREVIEW_SIZE}",
+            str(preview_png),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return preview_png
 
 
 def draw_slot_glyph(canvas: tk.Canvas, slot_key: str):
@@ -154,6 +239,7 @@ class SlotRow:
         self.on_change = on_change
         self.slot = slot
         self.path_var = tk.StringVar()
+        self.preview_image: tk.PhotoImage | None = None
 
         self.icon = tk.Canvas(master, width=28, height=28, highlightthickness=0, bg="white")
         self.icon.grid(row=row_index, column=0, padx=(0, 6), pady=3, sticky="w")
@@ -171,6 +257,17 @@ class SlotRow:
 
         self.clear_button = ttk.Button(master, text="Clear", command=self.clear)
         self.clear_button.grid(row=row_index, column=4, pady=3)
+
+        self.preview = tk.Canvas(
+            master,
+            width=PREVIEW_BORDER,
+            height=PREVIEW_BORDER,
+            bg="white",
+            highlightthickness=1,
+            highlightbackground="#c7c7c7",
+        )
+        self.preview.grid(row=row_index, column=5, padx=(10, 0), pady=3)
+        self.set_preview(None)
 
     def browse(self):
         patterns = " ".join(f"*{ext}" for ext in self.slot["allowed_extensions"])
@@ -192,16 +289,25 @@ class SlotRow:
     def get_path(self):
         return self.path_var.get().strip()
 
+    def set_preview(self, image: tk.PhotoImage | None):
+        self.preview.delete("all")
+        self.preview_image = image
+        if image is None:
+            self.preview.create_text(PREVIEW_BORDER // 2, PREVIEW_BORDER // 2, text="--", fill="#777777")
+        else:
+            self.preview.create_image(PREVIEW_BORDER // 2, PREVIEW_BORDER // 2, image=image)
+
 
 class MappingApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Cursor Source Slot Mapper")
-        root.geometry("1220x980")
+        root.geometry("1260x980")
 
         self.current_mapping_path: Path | None = None
         self.last_tar_path: Path | None = None
         self.last_theme_dir: Path | None = None
+        self.preview_photo_cache: dict[str, tk.PhotoImage] = {}
 
         self.source_dir_var = tk.StringVar()
         self.work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
@@ -228,10 +334,9 @@ class MappingApp:
             outer,
             text=(
                 "Workflow: choose a Windows cursor folder, click Auto-Fill, adjust any of the 16 slots if needed, "
-                "then click Build + Package. The builder keeps the original .cur/.ani sources until build time so it can "
-                "choose the best native image per Linux cursor size instead of flattening early."
+                "then click Build + Package. Each slot now also shows a small preview of the currently selected source."
             ),
-            wraplength=1150,
+            wraplength=1180,
             justify="left",
         )
         info.grid(row=1, column=0, sticky="w", pady=(4, 10))
@@ -245,7 +350,7 @@ class MappingApp:
             text=(
                 "1. Choose the Windows cursor folder.\n"
                 "2. Click Auto-Fill From Pack.\n"
-                "3. Fix any slot paths that look wrong.\n"
+                "3. Check the slot previews and fix any paths that look wrong.\n"
                 "4. Confirm the scale filter and output root.\n"
                 "5. Click Build + Package.\n"
                 "6. Install the generated .tar.gz cursor theme."
@@ -345,6 +450,35 @@ class MappingApp:
         self.status_var.set(message)
         self.root.update_idletasks()
 
+    def current_preview_root(self) -> Path:
+        work_root = Path(self.work_root_var.get().strip() or DEFAULT_WORK_ROOT).expanduser()
+        return work_root / "_preview-cache"
+
+    def load_slot_preview(self, source_path: Path) -> tk.PhotoImage | None:
+        resolved = source_path.expanduser().resolve()
+        cache_key = f"{resolved}::{resolved.stat().st_mtime_ns}"
+        if cache_key in self.preview_photo_cache:
+            return self.preview_photo_cache[cache_key]
+
+        preview_root = self.current_preview_root()
+        preview_source = resolve_preview_source_png(resolved, preview_root)
+        preview_png = render_preview_thumbnail(preview_source, preview_root)
+        image = tk.PhotoImage(file=str(preview_png))
+        self.preview_photo_cache[cache_key] = image
+        return image
+
+    def refresh_slot_previews(self):
+        for row in self.rows:
+            source_text = row.get_path()
+            if not source_text:
+                row.set_preview(None)
+                continue
+            try:
+                image = self.load_slot_preview(Path(source_text))
+            except Exception:
+                image = None
+            row.set_preview(image)
+
     def choose_source_dir(self):
         selected = filedialog.askdirectory(title="Choose Windows cursor folder")
         if selected:
@@ -356,10 +490,13 @@ class MappingApp:
         selected = filedialog.askdirectory(title="Choose output root")
         if selected:
             self.work_root_var.set(selected)
+            self.preview_photo_cache.clear()
+            self.refresh_slot_previews()
 
     def clear_rows(self):
         for row in self.rows:
             row.clear()
+            row.set_preview(None)
 
     def apply_payload(self, payload: dict):
         self.clear_rows()
@@ -469,6 +606,7 @@ class MappingApp:
         return "\n".join(lines) + "\n"
 
     def refresh_preview(self):
+        self.refresh_slot_previews()
         try:
             selected_slots, resolved = self.gather_mapping()
             text = self.render_markdown(selected_slots, resolved)

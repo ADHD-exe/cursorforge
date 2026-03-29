@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from build_glitch_theme import (
+from xcursor_builder import (
     HASH_ALIASES,
     build_cursor_file,
     ensure_clean_dir,

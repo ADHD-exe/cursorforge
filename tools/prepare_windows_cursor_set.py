@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -34,12 +35,28 @@ def discover_cursor_files(source_dir: Path) -> list[Path]:
     )
 
 
-def parse_install_inf(source_dir: Path) -> tuple[Path | None, dict[str, Path]]:
+def choose_preferred_inf(source_dir: Path) -> Path | None:
     inf_files = sorted(source_dir.glob("*.inf"))
     if not inf_files:
-        return None, {}
+        return None
 
-    inf_path = inf_files[0]
+    install_inf = next((path for path in inf_files if path.name.lower() == "install.inf"), None)
+    if install_inf is not None:
+        return install_inf
+
+    def inf_priority(path: Path) -> tuple[int, int, str]:
+        match = re.fullmatch(r"v(\d+)", path.stem.lower())
+        if match:
+            return (2, int(match.group(1)), path.name.lower())
+        return (1, 0, path.name.lower())
+
+    return max(inf_files, key=inf_priority)
+
+
+def parse_install_inf(source_dir: Path) -> tuple[Path | None, dict[str, Path]]:
+    inf_path = choose_preferred_inf(source_dir)
+    if inf_path is None:
+        return None, {}
     lines = inf_path.read_text(encoding="utf-8", errors="replace").splitlines()
     in_strings = False
     string_pairs: dict[str, str] = {}
@@ -87,6 +104,38 @@ def heuristic_slot_candidates(cursor_files: list[Path]) -> dict[str, list[dict]]
     return candidates
 
 
+def is_animated_default_pointer_candidate(path: Path) -> bool:
+    if path.suffix.lower() != ".ani":
+        return False
+
+    tokens = {token for token in re.split(r"[^a-z0-9]+", path.stem.lower()) if token}
+    positive_tokens = {
+        "appstart",
+        "appstarting",
+        "arrow",
+        "background",
+        "cursor",
+        "default",
+        "normal",
+        "pointer",
+        "select",
+        "start",
+        "working",
+    }
+    negative_tokens = {
+        "busy",
+        "error",
+        "hourglass",
+        "load",
+        "loading",
+        "spinner",
+        "wait",
+    }
+    if any(token == negative or token.startswith(negative) for token in tokens for negative in negative_tokens):
+        return False
+    return any(token == positive or token.startswith(positive) for token in tokens for positive in positive_tokens)
+
+
 def choose_slot_assignments(source_dir: Path, cursor_files: list[Path]) -> tuple[dict[str, Path], dict]:
     inf_path, inf_mapping = parse_install_inf(source_dir)
     heuristic_candidates = heuristic_slot_candidates(cursor_files)
@@ -97,6 +146,7 @@ def choose_slot_assignments(source_dir: Path, cursor_files: list[Path]) -> tuple
         "chosen_by_heuristic": {},
         "unmatched_files": [],
         "fallbacks": [],
+        "overrides": [],
     }
 
     used_paths: set[Path] = set()
@@ -138,6 +188,25 @@ def choose_slot_assignments(source_dir: Path, cursor_files: list[Path]) -> tuple
     for path in cursor_files:
         if path.resolve() not in used_paths:
             diagnostics["unmatched_files"].append(str(path.resolve()))
+
+    default_pointer = chosen.get("default_pointer")
+    progress_pointer = chosen.get("progress")
+    if (
+        default_pointer is not None
+        and default_pointer.suffix.lower() != ".ani"
+        and progress_pointer is not None
+        and is_animated_default_pointer_candidate(progress_pointer)
+        and progress_pointer != default_pointer
+    ):
+        chosen["default_pointer"] = progress_pointer
+        diagnostics["overrides"].append(
+            {
+                "target": "default_pointer",
+                "from": str(default_pointer),
+                "to": str(progress_pointer),
+                "reason": "prefer animated progress/start cursor as the Linux default pointer",
+            }
+        )
 
     return chosen, diagnostics
 

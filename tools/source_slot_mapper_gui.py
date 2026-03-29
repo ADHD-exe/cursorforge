@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple GUI for mapping a small source set onto a full Linux cursor role map."""
+"""GUI workflow for analyzing, reviewing, previewing, and exporting cursor packs."""
 
 from __future__ import annotations
 
@@ -19,24 +19,35 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from build_from_slot_mapping import build_theme_from_mapping
-from prepare_windows_cursor_set import prepare_windows_cursor_set
+from build_from_slot_mapping import (
+    build_theme_from_mapping,
+    load_source_metadata,
+    prepare_output_preview_metadata,
+)
+from prepare_windows_cursor_set import analyze_cursor_pack, prepare_windows_cursor_set
 from slot_definitions import (
+    BUILD_PRESETS,
+    BUILD_PRESET_BY_KEY,
     DEFAULT_CURSOR_SIZES,
     DEFAULT_SCALE_FILTER,
     SCALE_FILTER_CHOICES,
     SLOT_BY_KEY,
     SLOT_DEFS,
+    describe_build_preset,
     format_cursor_sizes,
     normalize_cursor_sizes,
+    score_slot_match,
 )
-from windows_cursor_tool import extract_asset, sanitize_path_component
+from windows_cursor_tool import sanitize_path_component
 
 
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_WORK_ROOT = REPO_ROOT / "gui-builds"
-PREVIEW_SIZE = 28
-PREVIEW_BORDER = 32
+CARD_PREVIEW_SIZE = 48
+PLAYER_PREVIEW_SIZE = 132
+CANDIDATE_PREVIEW_SIZE = 96
+CANVAS_SLOT_GLYPH_SIZE = 28
+LOW_CONFIDENCE_LABELS = {"likely blurry", "redraw recommended"}
 
 
 def build_payload(
@@ -92,53 +103,12 @@ def find_image_tool() -> str:
     raise RuntimeError("ImageMagick is required but neither 'magick' nor 'convert' was found")
 
 
-def preview_extract_dir(preview_root: Path, source_path: Path) -> Path:
-    digest = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()[:8]
-    return preview_root / "_extracted" / f"{sanitize_path_component(source_path.stem)}-{digest}"
-
-
-def preview_png_from_json(source_path: Path) -> Path:
-    payload = json.loads(source_path.read_text(encoding="utf-8"))
-    frames = payload.get("frames", [])
-    if not frames:
-        raise ValueError(f"metadata JSON contains no frames: {source_path}")
-
-    frame = frames[0]
-    if frame.get("entries"):
-        png_path = Path(frame["entries"][0]["png"])
-    elif frame.get("png"):
-        png_path = Path(frame["png"])
-    else:
-        raise ValueError(f"metadata JSON contains no previewable PNG path: {source_path}")
-
-    if not png_path.is_absolute():
-        png_path = (source_path.parent / png_path).resolve()
-    return png_path
-
-
-def resolve_preview_source_png(source_path: Path, preview_root: Path) -> Path:
-    suffix = source_path.suffix.lower()
-    if suffix == ".png":
-        return source_path.resolve()
-    if suffix == ".json":
-        return preview_png_from_json(source_path)
-
-    metadata = extract_asset(source_path, preview_extract_dir(preview_root, source_path))
-    frames = metadata.get("frames", [])
-    if not frames:
-        raise ValueError(f"no frames extracted from {source_path}")
-    entries = frames[0].get("entries", [])
-    if not entries:
-        raise ValueError(f"no entries extracted from {source_path}")
-    return Path(entries[0]["png"]).resolve()
-
-
-def render_preview_thumbnail(source_png: Path, preview_root: Path) -> Path:
+def render_preview_thumbnail(source_png: Path, preview_root: Path, box_size: int) -> Path:
     preview_root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(
-        f"{source_png.resolve()}::{source_png.stat().st_mtime_ns}".encode("utf-8")
+        f"{source_png.resolve()}::{source_png.stat().st_mtime_ns}::{box_size}".encode("utf-8")
     ).hexdigest()[:12]
-    preview_png = preview_root / f"{sanitize_path_component(source_png.stem)}_{digest}_{PREVIEW_SIZE}.png"
+    preview_png = preview_root / f"{sanitize_path_component(source_png.stem)}_{digest}_{box_size}.png"
     if preview_png.exists():
         return preview_png
 
@@ -152,9 +122,9 @@ def render_preview_thumbnail(source_png: Path, preview_root: Path) -> Path:
             "-gravity",
             "center",
             "-resize",
-            f"{PREVIEW_SIZE}x{PREVIEW_SIZE}",
+            f"{box_size}x{box_size}",
             "-extent",
-            f"{PREVIEW_SIZE}x{PREVIEW_SIZE}",
+            f"{box_size}x{box_size}",
             str(preview_png),
         ],
         check=True,
@@ -164,7 +134,433 @@ def render_preview_thumbnail(source_png: Path, preview_root: Path) -> Path:
     return preview_png
 
 
-def draw_slot_glyph(canvas: tk.Canvas, slot_key: str):
+def set_readonly_text(widget: tk.Text, text: str) -> None:
+    widget.configure(state="normal")
+    widget.delete("1.0", "end")
+    widget.insert("1.0", text)
+    widget.configure(state="disabled")
+
+
+def format_duration_ms(duration_ms: int) -> str:
+    if duration_ms <= 0:
+        return "--"
+    return f"{duration_ms / 1000:.2f}s"
+
+
+def quality_to_score(label: str) -> int:
+    return {
+        "excellent": 4,
+        "good": 3,
+        "acceptable": 2,
+        "likely blurry": 1,
+        "redraw recommended": 0,
+    }.get(label, 0)
+
+
+def summarize_metadata(source_path: Path, metadata: dict) -> dict:
+    frames = metadata.get("frames", [])
+    size_pairs = set()
+    entry_count = 0
+    hotspot_pairs = set()
+    for frame in frames:
+        entries = frame.get("entries", [])
+        if not entries and "png" in frame:
+            entries = [frame]
+        for entry in entries:
+            width = int(entry["width"])
+            height = int(entry["height"])
+            size_pairs.add((width, height))
+            hotspot_pairs.add((int(entry.get("hotspot_x", 0)), int(entry.get("hotspot_y", 0))))
+            entry_count += 1
+    largest_native_size = max((max(width, height) for width, height in size_pairs), default=0)
+    size_summary = " / ".join(str(size) for size in sorted({max(width, height) for width, height in size_pairs})) or "--"
+    return {
+        "path": str(source_path),
+        "filename": source_path.name,
+        "relative_path": str(source_path),
+        "source_type": metadata.get("asset_type", source_path.suffix.lower().lstrip(".") or "unknown"),
+        "is_animated": len(frames) > 1,
+        "frame_count": len(frames),
+        "entry_count": entry_count,
+        "delay_ms_total": sum(int(frame.get("delay_ms", 50)) for frame in frames),
+        "largest_native_size": largest_native_size,
+        "size_summary": size_summary,
+        "contains_non_square": any(width != height for width, height in size_pairs),
+        "hotspot_summary": ", ".join(f"{x},{y}" for x, y in sorted(hotspot_pairs)[:3]) or "--",
+        "warnings": [],
+    }
+
+
+def preview_entry_sort_key(entry: dict) -> tuple[int, int, int, int]:
+    colors = int(entry.get("colors", 0) or 0)
+    colors = 1_000_000 if colors == 0 else colors
+    return (
+        max(int(entry["width"]), int(entry["height"])),
+        int(entry["width"]) * int(entry["height"]),
+        int(entry.get("image_size", 0) or 0),
+        colors,
+    )
+
+
+def frames_from_source_metadata(metadata: dict) -> list[dict]:
+    frames = []
+    for frame_index, frame in enumerate(metadata.get("frames", [])):
+        entries = frame.get("entries", [])
+        if not entries and "png" in frame:
+            entries = [frame]
+        if not entries:
+            continue
+        entry = max(entries, key=preview_entry_sort_key)
+        frames.append(
+            {
+                "png": str(Path(entry["png"]).expanduser().resolve()),
+                "delay_ms": max(1, int(frame.get("delay_ms", 50))),
+                "width": int(entry["width"]),
+                "height": int(entry["height"]),
+                "hotspot_x": int(entry.get("hotspot_x", 0)),
+                "hotspot_y": int(entry.get("hotspot_y", 0)),
+                "frame_index": int(frame.get("frame_index", frame_index)),
+                "nominal_size": int(max(int(entry["width"]), int(entry["height"]))),
+            }
+        )
+    return frames
+
+
+def badges_for_summary(summary: dict) -> str:
+    animated = "ANI" if summary.get("is_animated") else "Static"
+    source_type = str(summary.get("source_type", "unknown")).upper()
+    frame_count = int(summary.get("frame_count", 0))
+    size_summary = summary.get("size_summary", "--")
+    return f"{animated} | {source_type} | {size_summary} | {frame_count} frame(s)"
+
+
+def compact_path(path: str, max_len: int = 78) -> str:
+    if len(path) <= max_len:
+        return path
+    return "..." + path[-(max_len - 3) :]
+
+
+def score_quality(summary: dict, target_sizes: list[int]) -> tuple[str, str]:
+    if summary.get("error"):
+        return "redraw recommended", "The source metadata could not be inspected cleanly."
+    if not target_sizes:
+        return "acceptable", "No target sizes are configured yet."
+    max_target = max(target_sizes)
+    max_native = int(summary.get("largest_native_size", 0))
+    if max_native >= max_target:
+        return "excellent", "The source already reaches the largest requested output size."
+    if max_native >= int(max_target * 0.75):
+        return "good", "Only moderate upscale is required for the largest output size."
+    if max_native >= int(max_target * 0.5):
+        return "acceptable", "The source can scale up, but larger sizes may soften."
+    if max_native >= int(max_target * 0.33):
+        return "likely blurry", "Large output sizes are substantially above the native source detail."
+    return "redraw recommended", "The selected source is far below the requested build sizes."
+
+
+def infer_slot_warnings(slot_key: str, summary: dict, target_sizes: list[int], pack_analysis: dict | None) -> list[str]:
+    warnings = list(summary.get("warnings", []))
+    if summary.get("error"):
+        warnings.append(summary["error"])
+        return warnings
+
+    max_target = max(target_sizes) if target_sizes else 0
+    max_native = int(summary.get("largest_native_size", 0))
+    if max_target and max_native < max_target:
+        warnings.append(f"largest native detail is {max_native}px; larger outputs will be scaled")
+    if max_target and max_native < 64:
+        warnings.append("source detail is small for modern HiDPI cursor sizes")
+    if summary.get("contains_non_square"):
+        warnings.append("contains non-square native art; review the predicted Linux preview")
+
+    stem = Path(summary["filename"]).stem
+    if slot_key == "default_pointer":
+        progress_score = score_slot_match(stem, SLOT_BY_KEY["progress"])
+        default_score = score_slot_match(stem, SLOT_BY_KEY["default_pointer"])
+        if progress_score >= default_score and progress_score > 0:
+            warnings.append("this default pointer name also looks like a progress/appstart cursor")
+
+    if pack_analysis is not None:
+        ambiguous = pack_analysis.get("ambiguous_candidates", {}).get(slot_key, [])
+        if ambiguous:
+            selected_path = summary["path"]
+            top_paths = {candidate["path"] for candidate in ambiguous}
+            if selected_path in top_paths:
+                warnings.append("slot choice is ambiguous based on filename heuristics alone")
+    return list(dict.fromkeys(warnings))
+
+
+class AnimationPreviewPanel(ttk.LabelFrame):
+    def __init__(self, master: tk.Widget, title: str, canvas_size: int):
+        super().__init__(master, text=title, padding=8)
+        self.canvas_size = canvas_size
+        self.frames: list[dict] = []
+        self.frame_images: list[tk.PhotoImage] = []
+        self.current_index = 0
+        self.running = False
+        self.after_id: str | None = None
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(
+            self,
+            width=canvas_size,
+            height=canvas_size,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#c6ccd2",
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        controls = ttk.Frame(self)
+        controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(1, weight=1)
+
+        self.play_button = ttk.Button(controls, text="Play", command=self.play)
+        self.play_button.grid(row=0, column=0, padx=(0, 6))
+        self.pause_button = ttk.Button(controls, text="Pause", command=self.pause)
+        self.pause_button.grid(row=0, column=1, sticky="w")
+        ttk.Button(controls, text="Replay", command=self.replay).grid(row=0, column=2, padx=(6, 6))
+
+        self.speed_var = tk.StringVar(value="1.0x")
+        self.speed_combo = ttk.Combobox(
+            controls,
+            textvariable=self.speed_var,
+            values=("0.5x", "1.0x", "1.5x", "2.0x"),
+            state="readonly",
+            width=6,
+        )
+        self.speed_combo.grid(row=0, column=3, sticky="e")
+        self.speed_combo.bind("<<ComboboxSelected>>", lambda _event: self._restart_if_running())
+
+        self.summary_var = tk.StringVar(value="No preview loaded")
+        self.summary_label = ttk.Label(self, textvariable=self.summary_var, justify="left", wraplength=canvas_size + 40)
+        self.summary_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        self.frame_info_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.frame_info_var, justify="left", wraplength=canvas_size + 40).grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=(2, 0),
+        )
+
+        self.clear("No preview loaded")
+
+    def destroy(self) -> None:
+        self._cancel_after()
+        super().destroy()
+
+    def _cancel_after(self) -> None:
+        if self.after_id is not None:
+            try:
+                self.after_cancel(self.after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self.after_id = None
+
+    def clear(self, reason: str) -> None:
+        self._cancel_after()
+        self.frames = []
+        self.frame_images = []
+        self.current_index = 0
+        self.running = False
+        self.canvas.delete("all")
+        self.canvas.create_text(
+            self.canvas_size // 2,
+            self.canvas_size // 2,
+            text="--",
+            fill="#7a7f86",
+            font=("TkDefaultFont", 14, "bold"),
+        )
+        self.summary_var.set(reason)
+        self.frame_info_var.set("")
+
+    def set_frames(self, frames: list[dict], images: list[tk.PhotoImage], summary: str, frame_info: str) -> None:
+        self._cancel_after()
+        if not frames or not images:
+            self.clear("No preview available")
+            return
+        self.frames = frames
+        self.frame_images = images
+        self.current_index = 0
+        self.running = len(frames) > 1
+        self.summary_var.set(summary)
+        self.frame_info_var.set(frame_info)
+        self._draw_current_frame()
+        if self.running:
+            self._schedule_next_frame()
+
+    def _draw_current_frame(self) -> None:
+        self.canvas.delete("all")
+        if not self.frame_images:
+            return
+        self.canvas.create_image(
+            self.canvas_size // 2,
+            self.canvas_size // 2,
+            image=self.frame_images[self.current_index],
+        )
+        self.canvas.create_text(
+            8,
+            self.canvas_size - 8,
+            anchor="sw",
+            fill="#4d535a",
+            text=f"{self.current_index + 1}/{len(self.frame_images)}",
+        )
+
+    def _speed_multiplier(self) -> float:
+        raw = self.speed_var.get().rstrip("x")
+        try:
+            value = float(raw)
+        except ValueError:
+            return 1.0
+        return max(0.1, value)
+
+    def _schedule_next_frame(self) -> None:
+        self._cancel_after()
+        if not self.running or len(self.frames) <= 1:
+            return
+        delay_ms = max(1, int(self.frames[self.current_index].get("delay_ms", 50)))
+        scaled_delay = max(1, int(delay_ms / self._speed_multiplier()))
+        self.after_id = self.after(scaled_delay, self._advance_frame)
+
+    def _advance_frame(self) -> None:
+        if not self.running or len(self.frame_images) <= 1:
+            return
+        self.current_index = (self.current_index + 1) % len(self.frame_images)
+        self._draw_current_frame()
+        self._schedule_next_frame()
+
+    def _restart_if_running(self) -> None:
+        if self.running:
+            self._schedule_next_frame()
+
+    def play(self) -> None:
+        if len(self.frame_images) <= 1:
+            return
+        self.running = True
+        self._schedule_next_frame()
+
+    def pause(self) -> None:
+        self.running = False
+        self._cancel_after()
+
+    def replay(self) -> None:
+        if not self.frame_images:
+            return
+        self.current_index = 0
+        self._draw_current_frame()
+        if len(self.frame_images) > 1:
+            self.running = True
+            self._schedule_next_frame()
+
+
+class SlotCard(tk.Frame):
+    def __init__(self, master: tk.Widget, slot: dict, app: "MappingApp"):
+        super().__init__(master, bd=1, relief="solid", bg="#eef2f5", padx=8, pady=8)
+        self.slot = slot
+        self.app = app
+        self.preview_image: tk.PhotoImage | None = None
+
+        self.grid_columnconfigure(1, weight=1)
+
+        self.glyph = tk.Canvas(
+            self,
+            width=CANVAS_SLOT_GLYPH_SIZE,
+            height=CANVAS_SLOT_GLYPH_SIZE,
+            highlightthickness=0,
+            bg="#eef2f5",
+        )
+        self.glyph.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, 8))
+        draw_slot_glyph(self.glyph, slot["key"], bg="#eef2f5")
+
+        self.title_label = tk.Label(self, text=slot["label"], bg="#eef2f5", fg="#0f1720", font=("TkDefaultFont", 10, "bold"))
+        self.title_label.grid(row=0, column=1, sticky="w")
+
+        self.preview_canvas = tk.Canvas(
+            self,
+            width=CARD_PREVIEW_SIZE,
+            height=CARD_PREVIEW_SIZE,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#c6ccd2",
+        )
+        self.preview_canvas.grid(row=0, column=2, rowspan=3, padx=(10, 0), sticky="ne")
+
+        self.file_label = tk.Label(self, text="Unassigned", bg="#eef2f5", fg="#2f3a45", anchor="w")
+        self.file_label.grid(row=1, column=1, sticky="w")
+
+        self.badge_label = tk.Label(self, text="Assign a source to preview it", bg="#eef2f5", fg="#55606c", anchor="w")
+        self.badge_label.grid(row=2, column=1, sticky="w")
+
+        self.path_label = tk.Label(
+            self,
+            text="",
+            bg="#eef2f5",
+            fg="#697582",
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        )
+        self.path_label.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(4, 0))
+
+        self.warning_label = tk.Label(
+            self,
+            text="",
+            bg="#eef2f5",
+            fg="#8b5a00",
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        )
+        self.warning_label.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+
+        button_row = ttk.Frame(self)
+        button_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(button_row, text="Review", command=lambda: app.select_slot(slot["key"])).grid(row=0, column=0)
+        ttk.Button(button_row, text="Browse", command=lambda: app.browse_slot(slot["key"])).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(button_row, text="Clear", command=lambda: app.clear_slot(slot["key"])).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(button_row, text="Candidates", command=lambda: app.focus_slot_candidates(slot["key"])).grid(row=0, column=3, padx=(6, 0))
+
+        self.bind("<Button-1>", lambda _event: app.select_slot(slot["key"]))
+        for child in self.winfo_children():
+            try:
+                child.bind("<Button-1>", lambda _event: app.select_slot(slot["key"]))
+            except Exception:  # noqa: BLE001
+                pass
+        self.update_card(None, None, None, False)
+
+    def update_card(self, path: str | None, summary: dict | None, quality: dict | None, selected: bool) -> None:
+        bg = "#e7f3ff" if selected else "#eef2f5"
+        for widget in (self, self.glyph, self.title_label, self.file_label, self.badge_label, self.path_label, self.warning_label):
+            widget.configure(bg=bg)
+        draw_slot_glyph(self.glyph, self.slot["key"], bg=bg)
+        self.configure(highlightbackground="#5e8fd8" if selected else "#d0d7de", highlightthickness=1, bd=0)
+
+        self.preview_canvas.delete("all")
+        if self.preview_image is not None:
+            self.preview_canvas.create_image(CARD_PREVIEW_SIZE // 2, CARD_PREVIEW_SIZE // 2, image=self.preview_image)
+        else:
+            self.preview_canvas.create_text(CARD_PREVIEW_SIZE // 2, CARD_PREVIEW_SIZE // 2, text="--", fill="#7a7f86")
+
+        if not path or summary is None:
+            self.file_label.configure(text="Unassigned")
+            self.badge_label.configure(text="Choose a source or use Auto-Fill")
+            self.path_label.configure(text="")
+            self.warning_label.configure(text="")
+            return
+
+        quality_label = quality["label"] if quality else "--"
+        self.file_label.configure(text=f"{Path(path).name}   [{quality_label}]")
+        self.badge_label.configure(text=badges_for_summary(summary))
+        self.path_label.configure(text=compact_path(path))
+        warnings = quality["warnings"] if quality else []
+        self.warning_label.configure(text=warnings[0] if warnings else "")
+
+
+def draw_slot_glyph(canvas: tk.Canvas, slot_key: str, bg: str = "white") -> None:
+    canvas.configure(bg=bg)
     canvas.delete("all")
     color = "#2b2b2b"
     accent = "#0f7b6c"
@@ -237,165 +633,209 @@ def draw_slot_glyph(canvas: tk.Canvas, slot_key: str):
         canvas.create_text(14, 14, text="*", fill=accent, font=("TkDefaultFont", 14, "bold"))
 
 
-class SlotRow:
-    def __init__(self, master: tk.Widget, row_index: int, slot: dict, on_change):
-        self.on_change = on_change
-        self.slot = slot
-        self.path_var = tk.StringVar()
-        self.preview_image: tk.PhotoImage | None = None
-
-        self.icon = tk.Canvas(master, width=28, height=28, highlightthickness=0, bg="white")
-        self.icon.grid(row=row_index, column=0, padx=(0, 6), pady=3, sticky="w")
-        draw_slot_glyph(self.icon, slot["key"])
-
-        self.label = ttk.Label(master, text=slot["label"], width=22, anchor="w")
-        self.label.grid(row=row_index, column=1, padx=(0, 6), pady=3, sticky="w")
-
-        self.path_entry = ttk.Entry(master, textvariable=self.path_var, width=62)
-        self.path_entry.grid(row=row_index, column=2, padx=(0, 6), pady=3, sticky="ew")
-        self.path_var.trace_add("write", lambda *_: self.on_change())
-
-        self.browse_button = ttk.Button(master, text="Browse", command=self.browse)
-        self.browse_button.grid(row=row_index, column=3, padx=(0, 6), pady=3)
-
-        self.clear_button = ttk.Button(master, text="Clear", command=self.clear)
-        self.clear_button.grid(row=row_index, column=4, pady=3)
-
-        self.preview = tk.Canvas(
-            master,
-            width=PREVIEW_BORDER,
-            height=PREVIEW_BORDER,
-            bg="white",
-            highlightthickness=1,
-            highlightbackground="#c7c7c7",
-        )
-        self.preview.grid(row=row_index, column=5, padx=(10, 0), pady=3)
-        self.set_preview(None)
-
-    def browse(self):
-        patterns = " ".join(f"*{ext}" for ext in self.slot["allowed_extensions"])
-        label = f"{self.slot['label']} files"
-        allowed = [(label, patterns), ("All supported", "*.ani *.cur *.png *.json")]
-        file_path = filedialog.askopenfilename(title="Select source cursor file", filetypes=allowed)
-        if file_path:
-            self.path_var.set(file_path)
-
-    def clear(self):
-        self.path_var.set("")
-
-    def set_value(self, path: str):
-        self.path_var.set(path)
-
-    def get_selected_slot(self):
-        return self.slot
-
-    def get_path(self):
-        return self.path_var.get().strip()
-
-    def set_preview(self, image: tk.PhotoImage | None):
-        self.preview.delete("all")
-        self.preview_image = image
-        if image is None:
-            self.preview.create_text(PREVIEW_BORDER // 2, PREVIEW_BORDER // 2, text="--", fill="#777777")
-        else:
-            self.preview.create_image(PREVIEW_BORDER // 2, PREVIEW_BORDER // 2, image=image)
-
-
 class MappingApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Cursor Source Slot Mapper")
-        root.geometry("1260x980")
+        self.root.title("win2kde Cursor Converter")
+        self.root.geometry("1560x1040")
 
         self.current_mapping_path: Path | None = None
         self.last_tar_path: Path | None = None
         self.last_theme_dir: Path | None = None
+        self.pack_analysis: dict | None = None
+        self.selected_slot_key = SLOT_DEFS[0]["key"]
+        self.selected_candidate_path: str | None = None
+
         self.preview_photo_cache: dict[str, tk.PhotoImage] = {}
+        self.source_metadata_cache: dict[str, dict] = {}
+        self.output_preview_cache: dict[str, dict] = {}
+        self.summary_cache: dict[str, dict] = {}
+        self.slot_paths = {slot["key"]: "" for slot in SLOT_DEFS}
 
         self.source_dir_var = tk.StringVar()
         self.work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
         self.theme_name_var = tk.StringVar(value="Custom-cursor")
         self.scale_filter_var = tk.StringVar(value=DEFAULT_SCALE_FILTER)
-        self.summary_var = tk.StringVar(value="0 source slots selected")
+        self.summary_var = tk.StringVar(value="No slots assigned yet")
         self.status_var = tk.StringVar(value="Ready")
         self.target_sizes = list(DEFAULT_CURSOR_SIZES)
         self.target_sizes_var = tk.StringVar(value=format_cursor_sizes(self.target_sizes))
+        self.build_preset_var = tk.StringVar(value="hidpi-kde")
+        self.preview_nominal_size_var = tk.StringVar(value=str(self._default_preview_size(self.target_sizes)))
+        self.preset_description_var = tk.StringVar(value=describe_build_preset(self.build_preset_var.get()))
+        self.overall_quality_var = tk.StringVar(value="Overall quality forecast: --")
+        self.last_output_var = tk.StringVar(value="No build output yet")
 
-        outer = ttk.Frame(root, padding=12)
+        self._build_ui()
+        self._refresh_all_views()
+
+        self.target_sizes_var.trace_add("write", lambda *_: self.on_build_settings_changed())
+        self.scale_filter_var.trace_add("write", lambda *_: self.on_build_settings_changed())
+        self.preview_nominal_size_var.trace_add("write", lambda *_: self._refresh_selected_slot_detail())
+        self.build_preset_var.trace_add("write", lambda *_: self._update_preset_description())
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=4)
-        outer.rowconfigure(5, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        title = ttk.Label(
-            outer,
-            text="Windows cursor pack -> Linux animated cursor theme",
-            font=("", 12, "bold"),
-        )
-        title.grid(row=0, column=0, sticky="w")
+        header = ttk.Frame(outer)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
 
-        info = ttk.Label(
-            outer,
+        ttk.Label(
+            header,
+            text="Windows cursor pack -> Linux Xcursor theme",
+            font=("", 13, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
             text=(
-                "Workflow: choose a Windows cursor folder, click Auto-Fill, adjust any of the 16 slots if needed, "
-                "then click Build + Package. Each slot now also shows a small preview of the currently selected source."
+                "Analyze the source pack, review or correct visual slot assignments, preview real animation behavior, "
+                "then build and export the final Linux cursor theme."
             ),
-            wraplength=1180,
+            wraplength=1450,
             justify="left",
-        )
-        info.grid(row=1, column=0, sticky="w", pady=(4, 10))
+        ).grid(row=1, column=0, sticky="w", pady=(4, 10))
 
-        workflow = ttk.LabelFrame(outer, text="Workflow", padding=10)
-        workflow.grid(row=2, column=0, sticky="ew")
-        workflow.columnconfigure(1, weight=1)
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
 
-        steps = ttk.Label(
-            workflow,
+        self.analysis_tab = ttk.Frame(self.notebook, padding=10)
+        self.review_tab = ttk.Frame(self.notebook, padding=10)
+        self.build_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.analysis_tab, text="1. Source Pack Analysis")
+        self.notebook.add(self.review_tab, text="2. Slot Review / Correction")
+        self.notebook.add(self.build_tab, text="3. Build / Export")
+
+        self._build_analysis_tab()
+        self._build_review_tab()
+        self._build_build_tab()
+
+        status_bar = ttk.Frame(outer)
+        status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        status_bar.columnconfigure(1, weight=1)
+        ttk.Label(status_bar, textvariable=self.summary_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+    def _build_analysis_tab(self) -> None:
+        self.analysis_tab.columnconfigure(0, weight=1)
+        self.analysis_tab.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(self.analysis_tab, text="Stage 1: Analyze The Source Pack", padding=10)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Windows cursor folder").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(controls, textvariable=self.source_dir_var).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Button(controls, text="Browse", command=self.choose_source_dir).grid(row=0, column=2, padx=(8, 0), pady=3)
+        ttk.Button(controls, text="Analyze Pack", command=self.analyze_pack).grid(row=0, column=3, padx=(8, 0), pady=3)
+        ttk.Button(controls, text="Auto-Fill From Pack", command=self.auto_prepare).grid(row=0, column=4, padx=(8, 0), pady=3)
+
+        ttk.Label(controls, text="Pack analysis").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=(12, 3))
+        ttk.Label(
+            controls,
             text=(
-                "1. Choose the Windows cursor folder.\n"
-                "2. Click Auto-Fill From Pack.\n"
-                "3. Check the slot previews and fix any paths that look wrong.\n"
-                "4. Confirm the output sizes, scale filter, and output root.\n"
-                "5. Click Build + Package.\n"
-                "6. Install the generated .tar.gz cursor theme."
+                "This stage summarizes pack quality before any slot correction: native sizes, animation coverage, "
+                "duplicate artifacts, likely HiDPI potential, and ambiguous filename matches."
             ),
+            wraplength=1120,
             justify="left",
+        ).grid(row=1, column=1, columnspan=4, sticky="w", pady=(12, 3))
+
+        overview = ttk.Frame(self.analysis_tab)
+        overview.grid(row=1, column=0, sticky="ew", pady=(10, 10))
+        overview.columnconfigure(0, weight=1)
+        overview.columnconfigure(1, weight=1)
+
+        left = ttk.LabelFrame(overview, text="Pack Overview", padding=10)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.columnconfigure(1, weight=1)
+        self.analysis_counts_var = tk.StringVar(value="Files: --")
+        self.analysis_inf_var = tk.StringVar(value="INF: --")
+        self.analysis_hidpi_var = tk.StringVar(value="HiDPI: --")
+        self.analysis_sizes_var = tk.StringVar(value="Largest native sizes: --")
+        self.analysis_animated_var = tk.StringVar(value="Animated sources: --")
+        for row_index, variable in enumerate(
+            (
+                self.analysis_counts_var,
+                self.analysis_inf_var,
+                self.analysis_hidpi_var,
+                self.analysis_sizes_var,
+                self.analysis_animated_var,
+            )
+        ):
+            ttk.Label(left, textvariable=variable, justify="left", wraplength=620).grid(
+                row=row_index,
+                column=0,
+                sticky="w",
+                pady=2,
+            )
+
+        right = ttk.LabelFrame(overview, text="Warnings And Diagnostics", padding=10)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        self.analysis_detail_text = tk.Text(right, height=8, wrap="word")
+        self.analysis_detail_text.grid(row=0, column=0, sticky="nsew")
+        set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
+
+        assets_frame = ttk.LabelFrame(self.analysis_tab, text="Detected Source Assets", padding=10)
+        assets_frame.grid(row=2, column=0, sticky="nsew")
+        assets_frame.columnconfigure(0, weight=1)
+        assets_frame.rowconfigure(0, weight=1)
+
+        columns = ("type", "animated", "sizes", "flags", "location")
+        self.analysis_asset_tree = ttk.Treeview(
+            assets_frame,
+            columns=columns,
+            show="tree headings",
+            selectmode="browse",
         )
-        steps.grid(row=0, column=4, rowspan=5, sticky="ne", padx=(14, 0))
+        self.analysis_asset_tree.heading("#0", text="Source")
+        self.analysis_asset_tree.heading("type", text="Type")
+        self.analysis_asset_tree.heading("animated", text="Animated")
+        self.analysis_asset_tree.heading("sizes", text="Native Sizes")
+        self.analysis_asset_tree.heading("flags", text="Warnings")
+        self.analysis_asset_tree.heading("location", text="Folder")
+        self.analysis_asset_tree.column("#0", width=280, anchor="w")
+        self.analysis_asset_tree.column("type", width=80, anchor="center")
+        self.analysis_asset_tree.column("animated", width=80, anchor="center")
+        self.analysis_asset_tree.column("sizes", width=140, anchor="center")
+        self.analysis_asset_tree.column("flags", width=330, anchor="w")
+        self.analysis_asset_tree.column("location", width=380, anchor="w")
+        self.analysis_asset_tree.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(workflow, text="Windows cursor folder").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(workflow, textvariable=self.source_dir_var).grid(row=0, column=1, sticky="ew", pady=3)
-        ttk.Button(workflow, text="Browse", command=self.choose_source_dir).grid(row=0, column=2, padx=(8, 0), pady=3)
-        ttk.Button(workflow, text="Auto-Fill From Pack", command=self.auto_prepare).grid(row=0, column=3, padx=(8, 0), pady=3)
+        scroll_y = ttk.Scrollbar(assets_frame, orient="vertical", command=self.analysis_asset_tree.yview)
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        self.analysis_asset_tree.configure(yscrollcommand=scroll_y.set)
 
-        ttk.Label(workflow, text="Output root").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(workflow, textvariable=self.work_root_var).grid(row=1, column=1, sticky="ew", pady=3)
-        ttk.Button(workflow, text="Browse", command=self.choose_work_root).grid(row=1, column=2, padx=(8, 0), pady=3)
+    def _build_review_tab(self) -> None:
+        self.review_tab.columnconfigure(0, weight=1)
+        self.review_tab.rowconfigure(0, weight=1)
 
-        ttk.Label(workflow, text="Theme name").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(workflow, textvariable=self.theme_name_var).grid(row=2, column=1, sticky="ew", pady=3)
-        ttk.Button(workflow, text="Build + Package", command=self.build_and_package).grid(
-            row=2, column=3, padx=(8, 0), pady=3
-        )
+        paned = ttk.Panedwindow(self.review_tab, orient="horizontal")
+        paned.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(workflow, text="Scale filter").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Combobox(
-            workflow,
-            textvariable=self.scale_filter_var,
-            values=SCALE_FILTER_CHOICES,
-            state="readonly",
-            width=18,
-        ).grid(row=3, column=1, sticky="w", pady=3)
+        left = ttk.Frame(paned, padding=(0, 0, 8, 0))
+        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(4, weight=1)
+        paned.add(left, weight=3)
+        paned.add(right, weight=5)
 
-        ttk.Label(workflow, text="Output sizes").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
-        sizes_entry = ttk.Entry(workflow, textvariable=self.target_sizes_var, width=32)
-        sizes_entry.grid(row=4, column=1, sticky="w", pady=3)
-        ttk.Label(workflow, text="comma-separated, e.g. 24, 32, 48, 96, 128, 192, 256").grid(
-            row=4, column=3, sticky="w", pady=3
-        )
+        ttk.Label(
+            left,
+            text="Stage 2: Review the guessed slot assignments visually. Paths stay available, but the primary signals are previews, animation badges, native sizes, and quality warnings.",
+            wraplength=500,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-        slot_frame = ttk.LabelFrame(outer, text="Source Slots", padding=10)
-        slot_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        slot_frame = ttk.Frame(left)
+        slot_frame.grid(row=1, column=0, sticky="nsew")
         slot_frame.columnconfigure(0, weight=1)
         slot_frame.rowconfigure(0, weight=1)
 
@@ -405,57 +845,234 @@ class MappingApp:
         slot_scroll.grid(row=0, column=1, sticky="ns")
         slot_canvas.configure(yscrollcommand=slot_scroll.set)
 
-        slot_inner = ttk.Frame(slot_canvas)
-        self.slot_inner = slot_inner
-        slot_inner.columnconfigure(2, weight=1)
-        slot_window = slot_canvas.create_window((0, 0), window=slot_inner, anchor="nw")
+        inner = ttk.Frame(slot_canvas)
+        inner.columnconfigure(0, weight=1)
+        self.slot_card_container = inner
+        slot_window = slot_canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        def _sync_slot_region(_event=None):
-            slot_canvas.configure(scrollregion=slot_canvas.bbox("all"))
+        inner.bind("<Configure>", lambda _event: slot_canvas.configure(scrollregion=slot_canvas.bbox("all")))
+        slot_canvas.bind("<Configure>", lambda event: slot_canvas.itemconfigure(slot_window, width=event.width))
 
-        def _resize_slot_inner(event):
-            slot_canvas.itemconfigure(slot_window, width=event.width)
+        self.slot_cards: dict[str, SlotCard] = {}
+        for row_index, slot in enumerate(SLOT_DEFS):
+            card = SlotCard(inner, slot, self)
+            card.grid(row=row_index, column=0, sticky="ew", pady=(0, 8))
+            self.slot_cards[slot["key"]] = card
 
-        slot_inner.bind("<Configure>", _sync_slot_region)
-        slot_canvas.bind("<Configure>", _resize_slot_inner)
-        slot_canvas.bind_all(
-            "<MouseWheel>",
-            lambda event: slot_canvas.yview_scroll(-1 * int(event.delta / 120), "units"),
+        detail = ttk.LabelFrame(right, text="Selected Slot Detail", padding=10)
+        detail.grid(row=0, column=0, sticky="ew")
+        detail.columnconfigure(0, weight=1)
+        detail.columnconfigure(1, weight=1)
+        self.selected_slot_title_var = tk.StringVar(value="Select a slot")
+        self.selected_slot_meta_var = tk.StringVar(value="")
+        self.selected_slot_path_var = tk.StringVar(value="")
+        ttk.Label(detail, textvariable=self.selected_slot_title_var, font=("", 11, "bold")).grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Label(detail, textvariable=self.selected_slot_meta_var, wraplength=800, justify="left").grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(4, 0),
+        )
+        ttk.Label(detail, textvariable=self.selected_slot_path_var, wraplength=800, justify="left", foreground="#55606c").grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(2, 8),
         )
 
-        self.rows = []
-        self.rows_by_key = {}
-        for idx, slot in enumerate(SLOT_DEFS):
-            row = SlotRow(slot_inner, idx, slot, self.refresh_preview)
-            self.rows.append(row)
-            self.rows_by_key[slot["key"]] = row
+        action_row = ttk.Frame(detail)
+        action_row.grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Button(action_row, text="Browse Source", command=lambda: self.browse_slot(self.selected_slot_key)).grid(row=0, column=0)
+        ttk.Button(action_row, text="Clear Slot", command=lambda: self.clear_slot(self.selected_slot_key)).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(action_row, text="Use Selected Candidate", command=self.apply_selected_candidate).grid(row=0, column=2, padx=(6, 0))
 
-        controls = ttk.Frame(outer)
-        controls.grid(row=4, column=0, sticky="ew", pady=(10, 8))
-        controls.columnconfigure(1, weight=1)
+        preview_size_row = ttk.Frame(detail)
+        preview_size_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(preview_size_row, text="Predicted preview size").grid(row=0, column=0, sticky="w")
+        self.preview_nominal_size_combo = ttk.Combobox(
+            preview_size_row,
+            textvariable=self.preview_nominal_size_var,
+            state="readonly",
+            width=10,
+        )
+        self.preview_nominal_size_combo.grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(controls, textvariable=self.summary_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(controls, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
-        ttk.Button(controls, text="Refresh Preview", command=self.refresh_preview).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(controls, text="Load JSON", command=self.load_json).grid(row=0, column=3, padx=(8, 0))
-        ttk.Button(controls, text="Save JSON", command=self.save_json).grid(row=0, column=4, padx=(8, 0))
-        ttk.Button(controls, text="Save Markdown", command=self.save_markdown).grid(row=0, column=5, padx=(8, 0))
+        warning_frame = ttk.LabelFrame(right, text="Slot Validation", padding=10)
+        warning_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        warning_frame.columnconfigure(0, weight=1)
+        self.slot_warning_text = tk.Text(warning_frame, height=6, wrap="word")
+        self.slot_warning_text.grid(row=0, column=0, sticky="nsew")
+        set_readonly_text(self.slot_warning_text, "Select a slot to inspect its warnings and quality forecast.")
 
-        preview_frame = ttk.LabelFrame(outer, text="Expanded Linux Role Map", padding=10)
-        preview_frame.grid(row=5, column=0, sticky="nsew")
-        preview_frame.columnconfigure(0, weight=1)
-        preview_frame.rowconfigure(0, weight=1)
+        preview_row = ttk.Frame(right)
+        preview_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        preview_row.columnconfigure(0, weight=1)
+        preview_row.columnconfigure(1, weight=1)
+        self.source_preview_panel = AnimationPreviewPanel(preview_row, "Source Animation Preview", PLAYER_PREVIEW_SIZE)
+        self.source_preview_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.output_preview_panel = AnimationPreviewPanel(preview_row, "Predicted Linux Output Preview", PLAYER_PREVIEW_SIZE)
+        self.output_preview_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        self.preview = tk.Text(preview_frame, wrap="none", height=10)
-        self.preview.grid(row=0, column=0, sticky="nsew")
-        yscroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
-        self.preview.configure(yscrollcommand=yscroll.set)
+        candidate_frame = ttk.LabelFrame(right, text="Ranked Candidate Browser", padding=10)
+        candidate_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        candidate_frame.columnconfigure(0, weight=1)
+        candidate_frame.rowconfigure(0, weight=1)
 
-        self.refresh_preview()
-        self.target_sizes_var.trace_add("write", lambda *_: self.refresh_preview())
+        self.candidate_tree = ttk.Treeview(
+            candidate_frame,
+            columns=("type", "sizes", "score", "reason"),
+            show="tree headings",
+            selectmode="browse",
+            height=8,
+        )
+        self.candidate_tree.heading("#0", text="Candidate")
+        self.candidate_tree.heading("type", text="Type")
+        self.candidate_tree.heading("sizes", text="Native Sizes")
+        self.candidate_tree.heading("score", text="Score")
+        self.candidate_tree.heading("reason", text="Ranking Reason")
+        self.candidate_tree.column("#0", width=240, anchor="w")
+        self.candidate_tree.column("type", width=70, anchor="center")
+        self.candidate_tree.column("sizes", width=110, anchor="center")
+        self.candidate_tree.column("score", width=70, anchor="center")
+        self.candidate_tree.column("reason", width=330, anchor="w")
+        self.candidate_tree.grid(row=0, column=0, sticky="nsew")
+        candidate_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=self.candidate_tree.yview)
+        candidate_scroll.grid(row=0, column=1, sticky="ns")
+        self.candidate_tree.configure(yscrollcommand=candidate_scroll.set)
+        self.candidate_tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_candidate_detail())
 
-    def set_status(self, message: str):
+        candidate_detail = ttk.Frame(candidate_frame)
+        candidate_detail.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        candidate_detail.columnconfigure(1, weight=1)
+        self.candidate_preview_panel = AnimationPreviewPanel(candidate_detail, "Candidate Preview", CANDIDATE_PREVIEW_SIZE)
+        self.candidate_preview_panel.grid(row=0, column=0, rowspan=2, sticky="nw")
+        self.candidate_summary_var = tk.StringVar(value="Select a candidate to inspect it.")
+        self.candidate_warning_var = tk.StringVar(value="")
+        ttk.Label(candidate_detail, textvariable=self.candidate_summary_var, wraplength=620, justify="left").grid(
+            row=0,
+            column=1,
+            sticky="nw",
+            padx=(10, 0),
+        )
+        ttk.Label(
+            candidate_detail,
+            textvariable=self.candidate_warning_var,
+            wraplength=620,
+            justify="left",
+            foreground="#8b5a00",
+        ).grid(row=1, column=1, sticky="nw", padx=(10, 0), pady=(6, 0))
+
+    def _build_build_tab(self) -> None:
+        self.build_tab.columnconfigure(0, weight=1)
+        self.build_tab.columnconfigure(1, weight=1)
+        self.build_tab.rowconfigure(1, weight=1)
+
+        top = ttk.LabelFrame(self.build_tab, text="Stage 3: Build Settings And Export", padding=10)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew")
+        top.columnconfigure(1, weight=1)
+        top.columnconfigure(4, weight=1)
+
+        ttk.Label(top, text="Build preset").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.preset_combo = ttk.Combobox(
+            top,
+            textvariable=self.build_preset_var,
+            values=[preset["key"] for preset in BUILD_PRESETS],
+            state="readonly",
+            width=18,
+        )
+        self.preset_combo.grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Button(top, text="Apply Preset", command=self.apply_selected_preset).grid(row=0, column=2, padx=(8, 0), pady=3)
+        ttk.Label(top, textvariable=self.preset_description_var, wraplength=760, justify="left").grid(
+            row=0,
+            column=3,
+            columnspan=2,
+            sticky="w",
+            padx=(12, 0),
+            pady=3,
+        )
+
+        ttk.Label(top, text="Theme name").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(top, textvariable=self.theme_name_var).grid(row=1, column=1, sticky="ew", pady=3)
+
+        ttk.Label(top, text="Output sizes").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(top, textvariable=self.target_sizes_var).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Label(top, text="Scale filter").grid(row=2, column=2, sticky="e", padx=(10, 8), pady=3)
+        ttk.Combobox(top, textvariable=self.scale_filter_var, values=SCALE_FILTER_CHOICES, state="readonly", width=12).grid(
+            row=2,
+            column=3,
+            sticky="w",
+            pady=3,
+        )
+        ttk.Label(top, text="Predicted preview size").grid(row=2, column=4, sticky="e", padx=(10, 8), pady=3)
+        self.build_preview_size_combo = ttk.Combobox(
+            top,
+            textvariable=self.preview_nominal_size_var,
+            state="readonly",
+            width=10,
+        )
+        self.build_preview_size_combo.grid(row=2, column=5, sticky="w", pady=3)
+
+        ttk.Label(top, text="Output root").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(top, textvariable=self.work_root_var).grid(row=3, column=1, columnspan=4, sticky="ew", pady=3)
+        ttk.Button(top, text="Browse", command=self.choose_work_root).grid(row=3, column=5, padx=(8, 0), pady=3)
+
+        quality_frame = ttk.LabelFrame(self.build_tab, text="Quality Forecast And Validation", padding=10)
+        quality_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(10, 0))
+        quality_frame.columnconfigure(0, weight=1)
+        quality_frame.rowconfigure(1, weight=1)
+        ttk.Label(quality_frame, textvariable=self.overall_quality_var, font=("", 11, "bold")).grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        self.build_warning_text = tk.Text(quality_frame, wrap="word")
+        self.build_warning_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        set_readonly_text(self.build_warning_text, "Warnings and build guidance will appear here.")
+
+        export_frame = ttk.LabelFrame(self.build_tab, text="Mapping, Export, And Final Output", padding=10)
+        export_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(10, 0))
+        export_frame.columnconfigure(0, weight=1)
+        export_frame.rowconfigure(1, weight=1)
+
+        button_row = ttk.Frame(export_frame)
+        button_row.grid(row=0, column=0, sticky="ew")
+        ttk.Button(button_row, text="Load JSON", command=self.load_json).grid(row=0, column=0)
+        ttk.Button(button_row, text="Save JSON", command=self.save_json).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(button_row, text="Save Markdown", command=self.save_markdown).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(button_row, text="Build + Package", command=self.build_and_package).grid(row=0, column=3, padx=(12, 0))
+
+        self.build_summary_text = tk.Text(export_frame, wrap="word")
+        self.build_summary_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        ttk.Label(export_frame, textvariable=self.last_output_var, wraplength=720, justify="left").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=(10, 0),
+        )
+
+        self._update_preview_size_choices()
+
+    def _update_preset_description(self) -> None:
+        preset_key = self.build_preset_var.get().strip()
+        if preset_key in BUILD_PRESET_BY_KEY:
+            self.preset_description_var.set(describe_build_preset(preset_key))
+
+    def _sync_preset_from_settings(self) -> None:
+        sizes, _error = self.try_target_sizes()
+        current_filter = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
+        for preset in BUILD_PRESETS:
+            if preset["target_sizes"] == sizes and preset["scale_filter"] == current_filter:
+                if self.build_preset_var.get() != preset["key"]:
+                    self.build_preset_var.set(preset["key"])
+                return
+
+    def set_status(self, message: str) -> None:
         self.status_var.set(message)
         self.root.update_idletasks()
 
@@ -463,49 +1080,76 @@ class MappingApp:
         work_root = Path(self.work_root_var.get().strip() or DEFAULT_WORK_ROOT).expanduser()
         return work_root / "_preview-cache"
 
-    def load_slot_preview(self, source_path: Path) -> tk.PhotoImage | None:
-        resolved = source_path.expanduser().resolve()
-        cache_key = f"{resolved}::{resolved.stat().st_mtime_ns}"
-        if cache_key in self.preview_photo_cache:
-            return self.preview_photo_cache[cache_key]
-
-        preview_root = self.current_preview_root()
-        preview_source = resolve_preview_source_png(resolved, preview_root)
-        preview_png = render_preview_thumbnail(preview_source, preview_root)
+    def preview_photo(self, png_path: Path, box_size: int) -> tk.PhotoImage:
+        resolved = png_path.expanduser().resolve()
+        key = f"{resolved}::{resolved.stat().st_mtime_ns}::{box_size}"
+        if key in self.preview_photo_cache:
+            return self.preview_photo_cache[key]
+        preview_png = render_preview_thumbnail(resolved, self.current_preview_root() / "_thumbs", box_size)
         image = tk.PhotoImage(file=str(preview_png))
-        self.preview_photo_cache[cache_key] = image
+        self.preview_photo_cache[key] = image
         return image
 
-    def refresh_slot_previews(self):
-        for row in self.rows:
-            source_text = row.get_path()
-            if not source_text:
-                row.set_preview(None)
-                continue
-            try:
-                image = self.load_slot_preview(Path(source_text))
-            except Exception:
-                image = None
-            row.set_preview(image)
+    def _source_metadata_cache_key(self, source_path: Path) -> str:
+        resolved = source_path.expanduser().resolve()
+        preview_root = self.current_preview_root()
+        return f"{resolved}::{resolved.stat().st_mtime_ns}::{preview_root}"
 
-    def choose_source_dir(self):
-        selected = filedialog.askdirectory(title="Choose Windows cursor folder")
-        if selected:
-            self.source_dir_var.set(selected)
-            if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
-                self.theme_name_var.set(slugify_name(Path(selected).name))
+    def ensure_source_metadata(self, source_path: Path) -> dict:
+        cache_key = self._source_metadata_cache_key(source_path)
+        if cache_key in self.source_metadata_cache:
+            return self.source_metadata_cache[cache_key]
+        metadata = load_source_metadata(source_path.expanduser().resolve(), self.current_preview_root() / "_source")
+        self.source_metadata_cache[cache_key] = metadata
+        return metadata
 
-    def choose_work_root(self):
-        selected = filedialog.askdirectory(title="Choose output root")
-        if selected:
-            self.work_root_var.set(selected)
-            self.preview_photo_cache.clear()
-            self.refresh_slot_previews()
+    def ensure_summary(self, source_path: Path) -> dict:
+        resolved = source_path.expanduser().resolve()
+        cache_key = self._source_metadata_cache_key(resolved)
+        if cache_key in self.summary_cache:
+            return self.summary_cache[cache_key]
+        metadata = self.ensure_source_metadata(resolved)
+        summary = summarize_metadata(resolved, metadata)
+        if self.pack_analysis is not None:
+            for asset in self.pack_analysis.get("asset_summaries", []):
+                if asset["path"] == str(resolved):
+                    summary["warnings"] = list(dict.fromkeys(asset.get("warnings", [])))
+                    summary["relative_path"] = asset.get("relative_path", summary["relative_path"])
+                    summary["source_type"] = asset.get("source_type", summary["source_type"])
+                    summary["largest_native_size"] = asset.get("largest_native_size", summary["largest_native_size"])
+                    summary["size_summary"] = asset.get("size_summary", summary["size_summary"])
+                    summary["contains_non_square"] = asset.get("contains_non_square", summary["contains_non_square"])
+                    break
+        self.summary_cache[cache_key] = summary
+        return summary
 
-    def clear_rows(self):
-        for row in self.rows:
-            row.clear()
-            row.set_preview(None)
+    def ensure_output_preview(self, source_path: Path, preview_nominal_size: int | None = None) -> dict:
+        sizes = self.try_target_sizes()[0]
+        filter_name = self.scale_filter_var.get().strip() or DEFAULT_SCALE_FILTER
+        resolved = source_path.expanduser().resolve()
+        cache_key = (
+            f"{resolved}::{resolved.stat().st_mtime_ns}::{format_cursor_sizes(sizes)}::"
+            f"{filter_name}::{preview_nominal_size or self.preview_nominal_size_var.get()}::{self.current_preview_root()}"
+        )
+        if cache_key in self.output_preview_cache:
+            return self.output_preview_cache[cache_key]
+        preview = prepare_output_preview_metadata(
+            resolved,
+            self.current_preview_root() / "_output",
+            sizes,
+            scale_filter=filter_name,
+            preview_nominal_size=preview_nominal_size,
+        )
+        self.output_preview_cache[cache_key] = preview
+        return preview
+
+    def try_target_sizes(self) -> tuple[list[int], str | None]:
+        try:
+            sizes = normalize_cursor_sizes(self.target_sizes_var.get(), fallback=self.target_sizes)
+            self.target_sizes = sizes
+            return sizes, None
+        except Exception as exc:  # noqa: BLE001
+            return list(self.target_sizes), str(exc)
 
     def current_target_sizes(self, normalize_display: bool = False) -> list[int]:
         sizes = normalize_cursor_sizes(self.target_sizes_var.get(), fallback=self.target_sizes)
@@ -516,53 +1160,204 @@ class MappingApp:
                 self.target_sizes_var.set(normalized_text)
         return sizes
 
-    def apply_payload(self, payload: dict):
-        self.clear_rows()
-        selected = payload.get("selected_slots", {})
-        role_map = payload.get("resolved_role_map", {})
-        build_options = payload.get("build_options", {})
-        used_keys = set()
+    def _default_preview_size(self, sizes: list[int]) -> int:
+        return min(sizes, key=lambda size: (abs(size - 32), size))
 
+    def _update_preview_size_choices(self) -> None:
+        sizes, _error = self.try_target_sizes()
+        values = [str(size) for size in sizes]
+        self.preview_nominal_size_combo.configure(values=values)
+        self.build_preview_size_combo.configure(values=values)
+        current = self.preview_nominal_size_var.get().strip()
+        if current not in values:
+            self.preview_nominal_size_var.set(str(self._default_preview_size(sizes)))
+
+    def choose_source_dir(self) -> None:
+        selected = filedialog.askdirectory(title="Choose Windows cursor folder")
+        if not selected:
+            return
+        self.source_dir_var.set(selected)
+        if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
+            self.theme_name_var.set(slugify_name(Path(selected).name))
+        self.set_status(f"Selected source pack: {selected}")
+
+    def choose_work_root(self) -> None:
+        selected = filedialog.askdirectory(title="Choose output root")
+        if not selected:
+            return
+        self.work_root_var.set(selected)
+        self.clear_preview_caches()
+        self.set_status(f"Selected output root: {selected}")
+        self._refresh_all_views()
+
+    def clear_preview_caches(self) -> None:
+        self.preview_photo_cache.clear()
+        self.source_metadata_cache.clear()
+        self.output_preview_cache.clear()
+        self.summary_cache.clear()
+
+    def analyze_pack(self) -> None:
+        source_dir_text = self.source_dir_var.get().strip()
+        if not source_dir_text:
+            messagebox.showerror("Missing source folder", "Choose a Windows cursor folder first.")
+            return
+        source_dir = Path(source_dir_text).expanduser()
+        if not source_dir.exists():
+            messagebox.showerror("Missing source folder", f"Folder does not exist:\n{source_dir}")
+            return
+        try:
+            self.set_status(f"Analyzing {source_dir}")
+            self.pack_analysis = analyze_cursor_pack(source_dir)
+            self.set_status(f"Analyzed {self.pack_analysis['counts']['total']} source assets")
+            self._render_pack_analysis()
+            self._refresh_all_views()
+        except Exception as exc:  # noqa: BLE001
+            self.set_status("Pack analysis failed")
+            messagebox.showerror("Pack analysis failed", str(exc))
+
+    def _render_pack_analysis(self) -> None:
+        analysis = self.pack_analysis
+        if analysis is None:
+            self.analysis_counts_var.set("Files: --")
+            self.analysis_inf_var.set("INF: --")
+            self.analysis_hidpi_var.set("HiDPI: --")
+            self.analysis_sizes_var.set("Largest native sizes: --")
+            self.analysis_animated_var.set("Animated sources: --")
+            set_readonly_text(self.analysis_detail_text, "Analyze a source pack to see diagnostics.")
+            for item in self.analysis_asset_tree.get_children():
+                self.analysis_asset_tree.delete(item)
+            return
+
+        counts = analysis["counts"]
+        self.analysis_counts_var.set(
+            f"Files: {counts['total']} total | {counts['cur']} .cur | {counts['ani']} .ani | {counts['png']} .png"
+        )
+        inf_details = analysis.get("install_inf")
+        if inf_details is None:
+            self.analysis_inf_var.set("INF: none found at pack root")
+        else:
+            self.analysis_inf_var.set(
+                f"INF: {Path(inf_details['path']).name} | {inf_details['reason']} | "
+                f"{analysis['install_inf_slots_resolved']} slot names resolved"
+            )
+        hidpi = analysis["hidpi_potential"]
+        self.analysis_hidpi_var.set(
+            f"HiDPI potential: {hidpi['rating']} | >=96px: {hidpi['supports_96_count']} | "
+            f">=128px: {hidpi['supports_128_count']} | >=192px: {hidpi['supports_192_count']}"
+        )
+        self.analysis_sizes_var.set(
+            "Largest native sizes: "
+            + (", ".join(str(size) for size in analysis["largest_native_sizes_found"]) or "--")
+        )
+        self.analysis_animated_var.set(f"Animated sources detected: {len(analysis['animated_sources'])}")
+
+        warning_lines = []
+        if analysis.get("warnings"):
+            warning_lines.append("Warnings:")
+            warning_lines.extend(f"- {warning}" for warning in analysis["warnings"])
+            warning_lines.append("")
+        if analysis.get("ambiguous_candidates"):
+            warning_lines.append("Ambiguous slots:")
+            for slot_key, candidates in sorted(analysis["ambiguous_candidates"].items()):
+                labels = ", ".join(Path(candidate["path"]).name for candidate in candidates[:3])
+                warning_lines.append(f"- {SLOT_BY_KEY[slot_key]['label']}: {labels}")
+            warning_lines.append("")
+        duplicate_artifacts = analysis.get("duplicate_artifacts", [])
+        if duplicate_artifacts:
+            warning_lines.append("Duplicate / temp-style artifacts:")
+            for artifact in duplicate_artifacts[:8]:
+                warning_lines.append(f"- {artifact['relative_path']} ({artifact['reason']})")
+        set_readonly_text(self.analysis_detail_text, "\n".join(warning_lines) or "No pack-level warnings.")
+
+        for item in self.analysis_asset_tree.get_children():
+            self.analysis_asset_tree.delete(item)
+        for asset in analysis.get("asset_summaries", []):
+            location = str(Path(asset["relative_path"]).parent)
+            if location == ".":
+                location = "pack root"
+            flags = "; ".join(asset.get("warnings", [])[:2]) or "--"
+            self.analysis_asset_tree.insert(
+                "",
+                "end",
+                text=asset["filename"],
+                values=(
+                    asset.get("source_type", "--"),
+                    "yes" if asset.get("is_animated") else "no",
+                    asset.get("size_summary", "--"),
+                    flags,
+                    location,
+                ),
+            )
+
+    def auto_prepare(self) -> None:
+        source_dir = Path(self.source_dir_var.get().strip()).expanduser()
+        if not str(source_dir):
+            messagebox.showerror("Missing source folder", "Choose a Windows cursor folder first.")
+            return
+        if not source_dir.exists():
+            messagebox.showerror("Missing source folder", f"Folder does not exist:\n{source_dir}")
+            return
+        work_root = Path(self.work_root_var.get().strip()).expanduser()
+        if not str(work_root):
+            messagebox.showerror("Missing output root", "Choose an output root first.")
+            return
+
+        prep_dir = work_root / "_prepared" / slugify_name(source_dir.name)
+        try:
+            self.set_status(f"Preparing {source_dir.name}")
+            summary = prepare_windows_cursor_set(source_dir, prep_dir)
+            self.pack_analysis = summary.get("analysis")
+            self._render_pack_analysis()
+            mapping_path = Path(summary["mapping_json"]).resolve()
+            payload = load_mapping_payload(mapping_path)
+            self.apply_payload(payload)
+            self.current_mapping_path = mapping_path
+            if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
+                self.theme_name_var.set(slugify_name(source_dir.name))
+            self.notebook.select(self.review_tab)
+            self.set_status(f"Auto-filled {summary['selected_slot_count']} source slots")
+            messagebox.showinfo(
+                "Auto-Fill Complete",
+                f"Prepared {summary['selected_slot_count']} slots.\n\nMapping JSON:\n{mapping_path}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.set_status("Auto-fill failed")
+            messagebox.showerror("Auto-fill failed", str(exc))
+
+    def apply_payload(self, payload: dict) -> None:
+        build_options = payload.get("build_options", {})
         scale_filter = build_options.get("scale_filter")
         if scale_filter in SCALE_FILTER_CHOICES:
             self.scale_filter_var.set(scale_filter)
-
         target_sizes = build_options.get("target_sizes")
         self.target_sizes = normalize_cursor_sizes(target_sizes, fallback=DEFAULT_CURSOR_SIZES)
         self.target_sizes_var.set(format_cursor_sizes(self.target_sizes))
+        self._update_preview_size_choices()
+        self._sync_preset_from_settings()
 
-        for slot_key, item in sorted(selected.items()):
-            row = self.rows_by_key.get(slot_key)
-            slot = SLOT_BY_KEY.get(slot_key)
-            if not row or not slot:
-                continue
-            path = item.get("path", "")
-            row.set_value(path)
-            used_keys.add(slot_key)
+        selected = payload.get("selected_slots", {})
+        role_map = payload.get("resolved_role_map", {})
+        self.slot_paths = {slot["key"]: "" for slot in SLOT_DEFS}
+
+        for slot_key, item in selected.items():
+            if slot_key in self.slot_paths:
+                self.slot_paths[slot_key] = item.get("path", "")
 
         if not selected and role_map:
             for slot in SLOT_DEFS:
-                if slot["key"] in used_keys:
-                    continue
-                candidate_path = ""
                 for role in slot["roles"]:
                     if role in role_map:
-                        candidate_path = role_map[role]
+                        self.slot_paths[slot["key"]] = role_map[role]
                         break
-                if not candidate_path:
-                    continue
-                self.rows_by_key[slot["key"]].set_value(candidate_path)
 
-        self.refresh_preview()
+        self.clear_preview_caches()
+        self._refresh_all_views()
 
-    def gather_mapping(self):
+    def gather_mapping(self) -> tuple[dict, dict]:
         selected_slots = {}
         duplicates = []
-        for row in self.rows:
-            slot = row.get_selected_slot()
-            if not slot:
-                continue
-            path = row.get_path()
+        for slot in SLOT_DEFS:
+            path = self.slot_paths.get(slot["key"], "").strip()
             if not path:
                 continue
             source_path = Path(path).expanduser()
@@ -582,14 +1377,11 @@ class MappingApp:
 
         resolved = {}
         for item in selected_slots.values():
-            slot = item["slot"]
-            path = item["path"]
-            for role in slot["roles"]:
-                resolved[role] = path
-
+            for role in item["slot"]["roles"]:
+                resolved[role] = item["path"]
         return selected_slots, resolved
 
-    def render_markdown(self, selected_slots, resolved, target_sizes):
+    def render_markdown(self, selected_slots: dict, resolved: dict, target_sizes: list[int]) -> str:
         lines = [
             "# Cursor Source Slot Mapping",
             "",
@@ -605,7 +1397,6 @@ class MappingApp:
             lines.append(f"- `{item['slot']['label']}` -> `{item['path']}`")
         if not selected_slots:
             lines.append("- None selected yet")
-
         lines.extend(
             [
                 "",
@@ -621,55 +1412,14 @@ class MappingApp:
             lines.append("| _none_ | _none_ |")
         return "\n".join(lines) + "\n"
 
-    def refresh_preview(self):
-        self.refresh_slot_previews()
-        try:
-            selected_slots, resolved = self.gather_mapping()
-            target_sizes = self.current_target_sizes()
-            text = self.render_markdown(selected_slots, resolved, target_sizes)
-            self.summary_var.set(
-                f"{len(selected_slots)} source slots selected, {len(resolved)} Linux cursor roles resolved"
-            )
-        except ValueError as exc:
-            text = f"Configuration error:\n\n{exc}\n"
-            self.summary_var.set("Fix duplicate slot assignments")
-
-        self.preview.delete("1.0", "end")
-        self.preview.insert("1.0", text)
-
-    def load_json(self):
-        target = filedialog.askopenfilename(
-            title="Load role mapping JSON",
-            filetypes=[("JSON files", "*.json")],
-        )
-        if not target:
-            return
-        try:
-            payload = load_mapping_payload(Path(target))
-            self.apply_payload(payload)
-            self.current_mapping_path = Path(target).resolve()
-            if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
-                self.theme_name_var.set(slugify_name(Path(target).stem))
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Unable to load mapping", str(exc))
-            return
-        self.set_status(f"Loaded mapping: {target}")
-        messagebox.showinfo("Loaded", f"Loaded mapping from:\n{target}")
-
-    def save_json(self):
+    def save_json(self) -> None:
         try:
             selected_slots, resolved = self.gather_mapping()
             target_sizes = self.current_target_sizes(normalize_display=True)
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
-
-        payload = build_payload(
-            selected_slots,
-            resolved,
-            target_sizes,
-            self.scale_filter_var.get(),
-        )
+        payload = build_payload(selected_slots, resolved, target_sizes, self.scale_filter_var.get())
         target = filedialog.asksaveasfilename(
             title="Save role mapping as JSON",
             defaultextension=".json",
@@ -683,14 +1433,13 @@ class MappingApp:
         self.set_status(f"Saved mapping: {target}")
         messagebox.showinfo("Saved", f"Saved JSON mapping to:\n{target}")
 
-    def save_markdown(self):
+    def save_markdown(self) -> None:
         try:
             selected_slots, resolved = self.gather_mapping()
             target_sizes = self.current_target_sizes(normalize_display=True)
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
-
         target = filedialog.asksaveasfilename(
             title="Save role mapping as Markdown",
             defaultextension=".md",
@@ -699,50 +1448,340 @@ class MappingApp:
         if not target:
             return
         Path(target).write_text(self.render_markdown(selected_slots, resolved, target_sizes), encoding="utf-8")
-        self.set_status(f"Saved preview markdown: {target}")
+        self.set_status(f"Saved mapping markdown: {target}")
         messagebox.showinfo("Saved", f"Saved Markdown mapping to:\n{target}")
 
-    def auto_prepare(self):
-        source_dir = Path(self.source_dir_var.get().strip()).expanduser()
-        if not str(source_dir):
-            messagebox.showerror("Missing source folder", "Choose a Windows cursor folder first.")
+    def load_json(self) -> None:
+        target = filedialog.askopenfilename(title="Load role mapping JSON", filetypes=[("JSON files", "*.json")])
+        if not target:
             return
-        if not source_dir.exists():
-            messagebox.showerror("Missing source folder", f"Folder does not exist:\n{source_dir}")
-            return
-
-        work_root = Path(self.work_root_var.get().strip()).expanduser()
-        if not str(work_root):
-            messagebox.showerror("Missing output root", "Choose an output root first.")
-            return
-
-        prep_dir = work_root / "_prepared" / slugify_name(source_dir.name)
         try:
-            self.set_status(f"Preparing Windows cursor set into {prep_dir}")
-            summary = prepare_windows_cursor_set(source_dir, prep_dir)
-            mapping_path = Path(summary["mapping_json"]).resolve()
-            payload = load_mapping_payload(mapping_path)
+            payload = load_mapping_payload(Path(target))
             self.apply_payload(payload)
-            self.current_mapping_path = mapping_path
+            self.current_mapping_path = Path(target).resolve()
             if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
-                self.theme_name_var.set(slugify_name(source_dir.name))
-            self.set_status(f"Auto-filled {summary['selected_slot_count']} slots from {source_dir.name}")
-            messagebox.showinfo(
-                "Auto-Fill Complete",
-                f"Prepared {summary['selected_slot_count']} slots.\n\nMapping JSON:\n{mapping_path}",
+                self.theme_name_var.set(slugify_name(Path(target).stem))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Unable to load mapping", str(exc))
+            return
+        self.set_status(f"Loaded mapping: {target}")
+        self.notebook.select(self.review_tab)
+
+    def select_slot(self, slot_key: str) -> None:
+        self.selected_slot_key = slot_key
+        self.selected_candidate_path = None
+        self._refresh_slot_cards()
+        self._refresh_selected_slot_detail()
+
+    def focus_slot_candidates(self, slot_key: str) -> None:
+        self.select_slot(slot_key)
+        self.notebook.select(self.review_tab)
+
+    def browse_slot(self, slot_key: str) -> None:
+        slot = SLOT_BY_KEY[slot_key]
+        patterns = " ".join(f"*{ext}" for ext in slot["allowed_extensions"])
+        label = f"{slot['label']} files"
+        allowed = [(label, patterns), ("All supported", "*.ani *.cur *.png *.json")]
+        file_path = filedialog.askopenfilename(title=f"Select source for {slot['label']}", filetypes=allowed)
+        if not file_path:
+            return
+        self.slot_paths[slot_key] = str(Path(file_path).expanduser().resolve())
+        self.clear_preview_caches()
+        self.select_slot(slot_key)
+        self.set_status(f"Assigned {slot['label']} -> {file_path}")
+
+    def clear_slot(self, slot_key: str) -> None:
+        self.slot_paths[slot_key] = ""
+        self.clear_preview_caches()
+        self.select_slot(slot_key)
+        self.set_status(f"Cleared {SLOT_BY_KEY[slot_key]['label']}")
+
+    def apply_selected_candidate(self) -> None:
+        if not self.selected_candidate_path:
+            messagebox.showerror("No candidate selected", "Select a candidate first.")
+            return
+        self.slot_paths[self.selected_slot_key] = self.selected_candidate_path
+        self.clear_preview_caches()
+        self.select_slot(self.selected_slot_key)
+        self.set_status(
+            f"Assigned {SLOT_BY_KEY[self.selected_slot_key]['label']} -> {Path(self.selected_candidate_path).name}"
+        )
+
+    def _slot_quality(self, slot_key: str, path: str) -> dict | None:
+        if not path:
+            return None
+        summary = self.ensure_summary(Path(path))
+        target_sizes = self.try_target_sizes()[0]
+        label, reason = score_quality(summary, target_sizes)
+        warnings = infer_slot_warnings(slot_key, summary, target_sizes, self.pack_analysis)
+        return {"label": label, "reason": reason, "warnings": warnings}
+
+    def _refresh_slot_cards(self) -> None:
+        for slot in SLOT_DEFS:
+            path = self.slot_paths.get(slot["key"], "").strip()
+            summary = None
+            quality = None
+            card = self.slot_cards[slot["key"]]
+            card.preview_image = None
+            if path:
+                try:
+                    summary = self.ensure_summary(Path(path))
+                    source_frames = frames_from_source_metadata(self.ensure_source_metadata(Path(path)))
+                    if source_frames:
+                        card.preview_image = self.preview_photo(Path(source_frames[0]["png"]), CARD_PREVIEW_SIZE)
+                    quality = self._slot_quality(slot["key"], path)
+                except Exception as exc:  # noqa: BLE001
+                    summary = {"filename": Path(path).name, "warnings": [str(exc)], "path": path}
+                    quality = {"label": "redraw recommended", "reason": str(exc), "warnings": [str(exc)]}
+            card.update_card(path if path else None, summary, quality, slot["key"] == self.selected_slot_key)
+
+    def _selected_slot_path(self) -> str:
+        return self.slot_paths.get(self.selected_slot_key, "").strip()
+
+    def _refresh_selected_slot_detail(self) -> None:
+        slot = SLOT_BY_KEY[self.selected_slot_key]
+        path = self._selected_slot_path()
+        self.selected_slot_title_var.set(slot["label"])
+        self.selected_candidate_path = None
+
+        if not path:
+            self.selected_slot_meta_var.set("No source selected yet.")
+            self.selected_slot_path_var.set("Use Auto-Fill, Browse Source, or choose a ranked candidate.")
+            set_readonly_text(self.slot_warning_text, "This slot is currently unassigned.")
+            self.source_preview_panel.clear("No source selected")
+            self.output_preview_panel.clear("No source selected")
+            self._populate_candidate_tree()
+            self._refresh_candidate_detail()
+            return
+
+        try:
+            source_path = Path(path)
+            summary = self.ensure_summary(source_path)
+            quality = self._slot_quality(self.selected_slot_key, path)
+            self.selected_slot_meta_var.set(
+                f"{badges_for_summary(summary)} | Quality forecast: {quality['label']} | {quality['reason']}"
+            )
+            self.selected_slot_path_var.set(compact_path(path, max_len=130))
+            warning_lines = quality["warnings"] or ["No immediate warnings."]
+            if summary.get("hotspot_summary"):
+                warning_lines.append(f"Hotspot summary: {summary['hotspot_summary']}")
+            set_readonly_text(self.slot_warning_text, "\n".join(f"- {line}" for line in warning_lines))
+            self._load_source_preview(source_path)
+            self._load_output_preview(source_path)
+        except Exception as exc:  # noqa: BLE001
+            self.selected_slot_meta_var.set("Unable to inspect the selected source.")
+            self.selected_slot_path_var.set(compact_path(path, max_len=130))
+            set_readonly_text(self.slot_warning_text, f"- {exc}")
+            self.source_preview_panel.clear(str(exc))
+            self.output_preview_panel.clear(str(exc))
+
+        self._populate_candidate_tree()
+        self._refresh_candidate_detail()
+
+    def _load_source_preview(self, source_path: Path) -> None:
+        metadata = self.ensure_source_metadata(source_path)
+        frames = frames_from_source_metadata(metadata)
+        if not frames:
+            self.source_preview_panel.clear("No extracted frames available")
+            return
+        images = [self.preview_photo(Path(frame["png"]), PLAYER_PREVIEW_SIZE) for frame in frames]
+        summary = (
+            f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))} total | "
+            f"using representative native entries"
+        )
+        frame_info = f"Actual source timing preserved. First frame nominal size: {frames[0]['nominal_size']}px."
+        self.source_preview_panel.set_frames(frames, images, summary, frame_info)
+
+    def _load_output_preview(self, source_path: Path) -> None:
+        preview_size = int(self.preview_nominal_size_var.get())
+        preview = self.ensure_output_preview(source_path, preview_size)
+        frames = preview["frames"]
+        images = [self.preview_photo(Path(frame["png"]), PLAYER_PREVIEW_SIZE) for frame in frames]
+        total_ms = sum(int(frame.get("delay_ms", 50)) for frame in frames)
+        if frames:
+            first = frames[0]
+            frame_info = (
+                f"Nominal size {preview['preview_nominal_size']}px | emitted PNG {first['width']}x{first['height']} | "
+                f"filter {preview['scale_filter']}"
+            )
+        else:
+            frame_info = "No predicted frames available"
+        summary = f"{len(frames)} frame(s) | {format_duration_ms(total_ms)} total | built path preview"
+        self.output_preview_panel.set_frames(frames, images, summary, frame_info)
+
+    def _populate_candidate_tree(self) -> None:
+        for item in self.candidate_tree.get_children():
+            self.candidate_tree.delete(item)
+        slot_candidates = {}
+        if self.pack_analysis is not None:
+            slot_candidates = self.pack_analysis.get("slot_candidates", {})
+        candidates = slot_candidates.get(self.selected_slot_key, [])
+        if not candidates:
+            self.candidate_tree.insert("", "end", iid="__none__", text="No ranked pack candidates available", values=("", "", "", ""))
+            return
+        for candidate in candidates[:12]:
+            candidate_id = candidate["path"]
+            self.candidate_tree.insert(
+                "",
+                "end",
+                iid=candidate_id,
+                text=candidate["filename"],
+                values=(
+                    ("ANI" if candidate["is_animated"] else "Static"),
+                    candidate["size_summary"],
+                    candidate["score"],
+                    candidate["reason"],
+                ),
+            )
+        current_path = self._selected_slot_path()
+        if current_path and current_path in self.candidate_tree.get_children():
+            self.candidate_tree.selection_set(current_path)
+        else:
+            first = self.candidate_tree.get_children()[0]
+            if first != "__none__":
+                self.candidate_tree.selection_set(first)
+
+    def _refresh_candidate_detail(self) -> None:
+        selection = self.candidate_tree.selection()
+        if not selection or selection[0] == "__none__":
+            self.selected_candidate_path = None
+            self.candidate_summary_var.set("Select a candidate to inspect it.")
+            self.candidate_warning_var.set("")
+            self.candidate_preview_panel.clear("No candidate selected")
+            return
+        candidate_path = selection[0]
+        self.selected_candidate_path = candidate_path
+        try:
+            summary = self.ensure_summary(Path(candidate_path))
+            quality = self._slot_quality(self.selected_slot_key, candidate_path)
+            self.candidate_summary_var.set(
+                f"{Path(candidate_path).name} | {badges_for_summary(summary)} | quality {quality['label']}"
+            )
+            self.candidate_warning_var.set("; ".join(quality["warnings"][:3]) or "No immediate candidate warnings.")
+            metadata = self.ensure_source_metadata(Path(candidate_path))
+            frames = frames_from_source_metadata(metadata)
+            images = [self.preview_photo(Path(frame["png"]), CANDIDATE_PREVIEW_SIZE) for frame in frames]
+            self.candidate_preview_panel.set_frames(
+                frames,
+                images,
+                f"{len(frames)} frame(s) | {format_duration_ms(sum(frame['delay_ms'] for frame in frames))}",
+                f"Candidate path: {compact_path(candidate_path, max_len=82)}",
             )
         except Exception as exc:  # noqa: BLE001
-            self.set_status("Auto-fill failed")
-            messagebox.showerror("Auto-fill failed", str(exc))
+            self.candidate_summary_var.set(Path(candidate_path).name)
+            self.candidate_warning_var.set(str(exc))
+            self.candidate_preview_panel.clear(str(exc))
 
-    def build_and_package(self):
+    def _refresh_build_summary(self) -> None:
+        sizes, size_error = self.try_target_sizes()
+        try:
+            selected_slots, resolved = self.gather_mapping()
+        except ValueError as exc:
+            selected_slots = {}
+            resolved = {}
+            mapping_error = str(exc)
+        else:
+            mapping_error = None
+
+        quality_labels = []
+        warning_lines = []
+        for slot in SLOT_DEFS:
+            path = self.slot_paths.get(slot["key"], "").strip()
+            if not path:
+                continue
+            quality = self._slot_quality(slot["key"], path)
+            if quality is None:
+                continue
+            quality_labels.append(quality["label"])
+            for warning in quality["warnings"][:2]:
+                warning_lines.append(f"- {slot['label']}: {warning}")
+
+        if mapping_error:
+            self.overall_quality_var.set("Overall quality forecast: configuration error")
+            warning_lines.insert(0, f"- Mapping error: {mapping_error}")
+        elif not quality_labels:
+            self.overall_quality_var.set("Overall quality forecast: no source slots assigned")
+        else:
+            avg_score = sum(quality_to_score(label) for label in quality_labels) / len(quality_labels)
+            if avg_score >= 3.5:
+                overall = "excellent"
+            elif avg_score >= 2.6:
+                overall = "good"
+            elif avg_score >= 1.8:
+                overall = "acceptable"
+            elif avg_score >= 1.0:
+                overall = "likely blurry"
+            else:
+                overall = "redraw recommended"
+            self.overall_quality_var.set(
+                f"Overall quality forecast: {overall} | {len(selected_slots)} slot(s) assigned | {len(resolved)} Linux roles resolved"
+            )
+
+        if size_error:
+            warning_lines.insert(0, f"- Output sizes: {size_error}")
+        if self.pack_analysis is not None:
+            for warning in self.pack_analysis.get("warnings", []):
+                warning_lines.append(f"- Pack: {warning}")
+
+        set_readonly_text(self.build_warning_text, "\n".join(dict.fromkeys(warning_lines)) or "No major warnings.")
+
+        build_summary_lines = [
+            f"Theme name: {self.theme_name_var.get().strip() or 'Custom-cursor'}",
+            f"Output root: {self.work_root_var.get().strip() or DEFAULT_WORK_ROOT}",
+            f"Target sizes: {format_cursor_sizes(sizes)}",
+            f"Scale filter: {self.scale_filter_var.get()}",
+            "",
+            "Selected slots:",
+        ]
+        if selected_slots:
+            for item in sorted(selected_slots.values(), key=lambda item: item["slot"]["label"]):
+                build_summary_lines.append(f"- {item['slot']['label']}: {item['path']}")
+        else:
+            build_summary_lines.append("- none")
+        build_summary_lines.extend(["", "Expanded Linux role map:"])
+        if resolved:
+            for role, path in sorted(resolved.items()):
+                build_summary_lines.append(f"- {role}: {path}")
+        else:
+            build_summary_lines.append("- none")
+        set_readonly_text(self.build_summary_text, "\n".join(build_summary_lines))
+
+    def _refresh_all_views(self) -> None:
+        self._sync_preset_from_settings()
+        self._update_preview_size_choices()
+        self._render_pack_analysis()
+        self._refresh_slot_cards()
+        self._refresh_selected_slot_detail()
+        self._refresh_build_summary()
+        try:
+            selected_slots, resolved = self.gather_mapping()
+            self.summary_var.set(
+                f"{len(selected_slots)} source slots selected, {len(resolved)} Linux cursor roles resolved"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.summary_var.set(str(exc))
+
+    def on_build_settings_changed(self) -> None:
+        self._update_preview_size_choices()
+        self.output_preview_cache.clear()
+        self._refresh_all_views()
+
+    def apply_selected_preset(self) -> None:
+        preset = BUILD_PRESET_BY_KEY[self.build_preset_var.get()]
+        self.target_sizes_var.set(format_cursor_sizes(preset["target_sizes"]))
+        self.scale_filter_var.set(preset["scale_filter"])
+        self.preset_description_var.set(describe_build_preset(preset["key"]))
+        self.preview_nominal_size_var.set(str(self._default_preview_size(preset["target_sizes"])))
+        self.set_status(f"Applied preset: {preset['label']}")
+        self._refresh_all_views()
+
+    def build_and_package(self) -> None:
         try:
             selected_slots, resolved = self.gather_mapping()
             target_sizes = self.current_target_sizes(normalize_display=True)
         except ValueError as exc:
             messagebox.showerror("Invalid mapping", str(exc))
             return
-
         if not selected_slots:
             messagebox.showerror("No source slots", "Assign at least one slot before building.")
             return
@@ -756,9 +1795,8 @@ class MappingApp:
         )
         if not theme_name:
             return
-        theme_name = theme_name.strip()
-        safe_theme_name = slugify_name(theme_name)
-        self.theme_name_var.set(theme_name)
+        safe_theme_name = slugify_name(theme_name.strip())
+        self.theme_name_var.set(theme_name.strip())
 
         work_root = Path(self.work_root_var.get().strip()).expanduser()
         if not str(work_root):
@@ -766,12 +1804,7 @@ class MappingApp:
             return
         work_root.mkdir(parents=True, exist_ok=True)
 
-        payload = build_payload(
-            selected_slots,
-            resolved,
-            target_sizes,
-            self.scale_filter_var.get(),
-        )
+        payload = build_payload(selected_slots, resolved, target_sizes, self.scale_filter_var.get())
         build_root = work_root / "_builds" / safe_theme_name
         mapping_store_dir = work_root / "_mappings"
         mapping_path = mapping_store_dir / f"{safe_theme_name}.json"
@@ -818,6 +1851,10 @@ class MappingApp:
 
             self.last_theme_dir = final_theme_dir
             self.last_tar_path = tar_path
+            self.last_output_var.set(
+                f"Theme directory: {final_theme_dir}\nTarball: {tar_path}\nMapping JSON: {mapping_path}"
+            )
+            self.notebook.select(self.build_tab)
             self.set_status(f"Built theme and tarball: {tar_path}")
             messagebox.showinfo(
                 "Build Complete",
@@ -828,7 +1865,7 @@ class MappingApp:
             messagebox.showerror("Build failed", str(exc))
 
 
-def main(argv: list[str] | None = None):
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--load", type=Path, help="preload a mapping JSON into the GUI")
     parser.add_argument("--auto-close-ms", type=int, default=0, help="close automatically after N milliseconds")
@@ -839,6 +1876,7 @@ def main(argv: list[str] | None = None):
     if "clam" in style.theme_names():
         style.theme_use("clam")
     app = MappingApp(root)
+    app.preset_description_var.set(describe_build_preset(app.build_preset_var.get()))
 
     if args.load:
         payload = load_mapping_payload(args.load)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared cursor slot definitions and heuristics."""
+"""Shared cursor slot definitions, heuristics, and GUI-friendly build presets."""
 
 from __future__ import annotations
 
@@ -9,6 +9,44 @@ import re
 DEFAULT_CURSOR_SIZES = [24, 32, 36, 48, 64, 96, 128, 192]
 DEFAULT_SCALE_FILTER = "point"
 SCALE_FILTER_CHOICES = ("point", "mitchell", "lanczos")
+
+BUILD_PRESETS = [
+    {
+        "key": "standard-linux",
+        "label": "Standard Linux",
+        "description": "Balanced desktop sizes for everyday Linux use without oversized outputs.",
+        "target_sizes": [24, 32, 36, 48, 64],
+        "scale_filter": "point",
+    },
+    {
+        "key": "hidpi-kde",
+        "label": "HiDPI KDE",
+        "description": "Keeps the current larger-size workflow for Plasma and high-density displays.",
+        "target_sizes": [24, 32, 36, 48, 64, 96, 128, 192],
+        "scale_filter": "point",
+    },
+    {
+        "key": "maximum-detail",
+        "label": "Maximum Detail",
+        "description": "Pushes large outputs, including 256px, for packs with strong native source art.",
+        "target_sizes": [24, 32, 36, 48, 64, 96, 128, 192, 256],
+        "scale_filter": "lanczos",
+    },
+    {
+        "key": "pixel-glitch",
+        "label": "Pixel / Glitch",
+        "description": "Keeps hard edges and nearest-neighbor style scaling for crisp retro or glitch themes.",
+        "target_sizes": [24, 32, 36, 48, 64, 96, 128, 192],
+        "scale_filter": "point",
+    },
+    {
+        "key": "smooth-aa",
+        "label": "Smooth / Anti-aliased",
+        "description": "Favors smoother scaled output when the source art can support it.",
+        "target_sizes": [24, 32, 36, 48, 64, 96, 128, 192],
+        "scale_filter": "lanczos",
+    },
+]
 
 
 SLOT_DEFS = [
@@ -299,6 +337,7 @@ UNUSED = "-- unused --"
 SLOT_LABELS = [UNUSED] + [slot["label"] for slot in SLOT_DEFS]
 SLOT_BY_LABEL = {slot["label"]: slot for slot in SLOT_DEFS}
 SLOT_BY_KEY = {slot["key"]: slot for slot in SLOT_DEFS}
+BUILD_PRESET_BY_KEY = {preset["key"]: preset for preset in BUILD_PRESETS}
 
 
 def normalize_cursor_sizes(
@@ -323,6 +362,14 @@ def normalize_cursor_sizes(
 
 def format_cursor_sizes(raw_sizes: str | list[int] | tuple[int, ...] | set[int] | None) -> str:
     return ", ".join(str(size) for size in normalize_cursor_sizes(raw_sizes))
+
+
+def describe_build_preset(preset_key: str) -> str:
+    preset = BUILD_PRESET_BY_KEY[preset_key]
+    return (
+        f"{preset['label']}: {preset['description']} "
+        f"Sizes {format_cursor_sizes(preset['target_sizes'])}; filter {preset['scale_filter']}."
+    )
 
 
 def normalized_tokens(name: str) -> list[str]:

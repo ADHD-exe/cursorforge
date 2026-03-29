@@ -70,6 +70,14 @@ def _iter_riff_chunks(data: bytes, start: int, end: int):
         pos = payload_end + (chunk_size & 1)
 
 
+def _parse_u32_chunk(chunk_name: str, payload: bytes) -> list[int]:
+    if len(payload) % 4 != 0:
+        raise ValueError(f"ANI {chunk_name} chunk length {len(payload)} is not a multiple of 4 bytes")
+    if not payload:
+        return []
+    return list(struct.unpack(f"<{len(payload) // 4}I", payload))
+
+
 def parse_ani_bytes(data: bytes) -> dict:
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"ACON":
         raise ValueError("not an ANI file")
@@ -99,19 +107,9 @@ def parse_ani_bytes(data: bytes) -> dict:
                 "flags": fields[8],
             }
         elif chunk_id == "rate":
-            rates = list(
-                struct.unpack(
-                    f"<{(payload_end - payload_start) // 4}I",
-                    data[payload_start:payload_end],
-                )
-            )
+            rates = _parse_u32_chunk("rate", data[payload_start:payload_end])
         elif chunk_id == "seq ":
-            sequence = list(
-                struct.unpack(
-                    f"<{(payload_end - payload_start) // 4}I",
-                    data[payload_start:payload_end],
-                )
-            )
+            sequence = _parse_u32_chunk("seq", data[payload_start:payload_end])
         elif chunk_id == "LIST":
             if payload_end - payload_start < 4:
                 continue
@@ -128,6 +126,8 @@ def parse_ani_bytes(data: bytes) -> dict:
         raise ValueError("ANI file contains no icon frames")
 
     steps = anih["steps"] or len(sequence) or len(icons)
+    if steps < 1:
+        raise ValueError("ANI file contains no animation steps")
     if not sequence:
         sequence = list(range(min(steps, len(icons))))
     if not rates:
@@ -137,7 +137,15 @@ def parse_ani_bytes(data: bytes) -> dict:
 
     frame_entries = []
     for step_index in range(steps):
-        icon_index = sequence[step_index] if step_index < len(sequence) else step_index
+        if step_index < len(sequence):
+            icon_index = sequence[step_index]
+        else:
+            icon_index = step_index
+        if icon_index >= len(icons):
+            raise ValueError(
+                f"ANI step {step_index} references icon index {icon_index}, "
+                f"but only {len(icons)} embedded icon frame(s) are available"
+            )
         icon_bytes = icons[icon_index]
         cur_info = parse_cur_bytes(icon_bytes)
         delay_jiffies = rates[step_index]
@@ -152,8 +160,10 @@ def parse_ani_bytes(data: bytes) -> dict:
                         "index": entry["index"],
                         "width": entry["width"],
                         "height": entry["height"],
+                        "colors": entry["colors"],
                         "hotspot_x": entry["hotspot_x"],
                         "hotspot_y": entry["hotspot_y"],
+                        "image_size": entry["image_size"],
                     }
                     for entry in cur_info["entries"]
                 ],
@@ -235,8 +245,10 @@ def _extract_entries(
                 "png": str(output_png),
                 "width": entry["width"],
                 "height": entry["height"],
+                "colors": entry.get("colors"),
                 "hotspot_x": entry["hotspot_x"],
                 "hotspot_y": entry["hotspot_y"],
+                "image_size": entry.get("image_size"),
                 source_index_key: entry["index"],
                 "delay_ms": delay_ms,
             }

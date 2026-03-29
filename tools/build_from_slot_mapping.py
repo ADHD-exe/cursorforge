@@ -97,6 +97,7 @@ def png_metadata(source_path: Path) -> dict:
                         "hotspot_x": 0,
                         "hotspot_y": 0,
                         "entry_index": 1,
+                        "image_size": source_path.stat().st_size,
                     }
                 ],
             }
@@ -105,6 +106,9 @@ def png_metadata(source_path: Path) -> dict:
 
 
 def resolve_png_entry(entry: dict, base_dir: Path, fallback_index: int) -> dict:
+    if "png" not in entry:
+        raise ValueError("metadata entry is missing a png path")
+
     entry_copy = dict(entry)
     png_path = Path(entry_copy["png"])
     if not png_path.is_absolute():
@@ -112,26 +116,68 @@ def resolve_png_entry(entry: dict, base_dir: Path, fallback_index: int) -> dict:
     if not png_path.exists():
         raise FileNotFoundError(f"metadata PNG does not exist: {png_path}")
 
+    actual_width, actual_height = identify_png_size(png_path)
     width = entry_copy.get("width")
     height = entry_copy.get("height")
     if width is None or height is None:
-        width, height = identify_png_size(png_path)
+        width, height = actual_width, actual_height
+    else:
+        width = int(width)
+        height = int(height)
+        if (width, height) != (actual_width, actual_height):
+            raise ValueError(
+                f"metadata dimensions for {png_path} are {width}x{height}, "
+                f"but the PNG is {actual_width}x{actual_height}"
+            )
+
+    if width <= 0 or height <= 0:
+        raise ValueError(f"metadata entry dimensions must be positive, got {width}x{height} for {png_path}")
 
     entry_copy["png"] = str(png_path)
-    entry_copy["width"] = int(width)
-    entry_copy["height"] = int(height)
+    entry_copy["width"] = width
+    entry_copy["height"] = height
     entry_copy["hotspot_x"] = int(entry_copy.get("hotspot_x", 0))
     entry_copy["hotspot_y"] = int(entry_copy.get("hotspot_y", 0))
+    if entry_copy["hotspot_x"] < 0 or entry_copy["hotspot_x"] >= width:
+        raise ValueError(f"hotspot_x {entry_copy['hotspot_x']} is outside {width}px width for {png_path}")
+    if entry_copy["hotspot_y"] < 0 or entry_copy["hotspot_y"] >= height:
+        raise ValueError(f"hotspot_y {entry_copy['hotspot_y']} is outside {height}px height for {png_path}")
     entry_copy["entry_index"] = int(entry_copy.get("entry_index", entry_copy.get("index", fallback_index)))
+    if "colors" in entry_copy and entry_copy["colors"] is not None:
+        entry_copy["colors"] = int(entry_copy["colors"])
+        if entry_copy["colors"] < 0:
+            raise ValueError(f"colors must be non-negative for {png_path}")
+    if "image_size" in entry_copy and entry_copy["image_size"] is not None:
+        entry_copy["image_size"] = int(entry_copy["image_size"])
+        if entry_copy["image_size"] < 0:
+            raise ValueError(f"image_size must be non-negative for {png_path}")
+    else:
+        entry_copy["image_size"] = png_path.stat().st_size
     return entry_copy
 
 
 def metadata_from_json(source_path: Path) -> dict:
     payload = json.loads(source_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"metadata JSON root must be an object: {source_path}")
+    raw_frames = payload.get("frames", [])
+    if not isinstance(raw_frames, list):
+        raise ValueError(f"metadata JSON frames must be a list: {source_path}")
     frames = []
-    for frame_index, frame in enumerate(payload.get("frames", [])):
+    for frame_index, frame in enumerate(raw_frames):
+        if not isinstance(frame, dict):
+            raise ValueError(f"metadata frame {frame_index} must be an object: {source_path}")
         delay_ms = int(frame.get("delay_ms", 50))
-        raw_entries = frame.get("entries") or [frame]
+        if delay_ms < 0:
+            raise ValueError(f"metadata frame {frame_index} delay_ms must be non-negative: {source_path}")
+        if "entries" in frame:
+            raw_entries = frame["entries"]
+        else:
+            raw_entries = [frame]
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"metadata frame {frame_index} entries must be a list: {source_path}")
+        if not raw_entries:
+            raise ValueError(f"metadata frame {frame_index} entries list is empty: {source_path}")
         resolved_entries = [
             resolve_png_entry(entry, source_path.parent, entry_index)
             for entry_index, entry in enumerate(raw_entries, start=1)
@@ -141,9 +187,15 @@ def metadata_from_json(source_path: Path) -> dict:
                 "frame_index": int(frame.get("frame_index", frame_index)),
                 "icon_index": frame.get("icon_index"),
                 "delay_ms": delay_ms,
+                "nominal_size": frame.get("nominal_size"),
                 "entries": sorted(
                     resolved_entries,
-                    key=lambda item: (item["width"], item["height"], item["entry_index"]),
+                    key=lambda item: (
+                        item["width"],
+                        item["height"],
+                        -int(item.get("image_size", 0) or 0),
+                        item["entry_index"],
+                    ),
                 ),
             }
         )
@@ -182,7 +234,8 @@ def localize_metadata_frames(metadata: dict, localized_dir: Path) -> dict:
         frame_index = int(frame.get("frame_index", sequence_index))
         entry_index = int(frame.get("entry_index", 1) or 1)
         target_name = (
-            f"f{frame_index:03d}_s{int(frame['width']):03d}_e{entry_index:02d}_"
+            f"f{frame_index:03d}_n{int(frame.get('nominal_size', frame['width'])):03d}_"
+            f"{int(frame['width']):03d}x{int(frame['height']):03d}_e{entry_index:02d}_"
             f"{sanitize_path_component(source_png.stem)}_{digest}{suffix}"
         )
         target_path = localized_dir / target_name
@@ -200,6 +253,65 @@ def localize_metadata_frames(metadata: dict, localized_dir: Path) -> dict:
     if not localized["frames"]:
         raise ValueError("localized metadata contains no frames")
     return localized
+
+
+def choose_preview_nominal_size(target_sizes: list[int], preferred_size: int = 32) -> int:
+    sizes = parse_size_list(target_sizes)
+    return min(sizes, key=lambda size: (abs(size - preferred_size), size))
+
+
+def prepare_output_preview_metadata(
+    source_path: Path,
+    preview_root: Path,
+    target_sizes: list[int] | None = None,
+    *,
+    scale_filter: str | None = None,
+    preview_nominal_size: int | None = None,
+) -> dict:
+    source_path = source_path.expanduser().resolve()
+    preview_root = preview_root.expanduser().resolve()
+    preview_root.mkdir(parents=True, exist_ok=True)
+
+    sizes = parse_size_list(target_sizes)
+    filter_name = (scale_filter or DEFAULT_SCALE_FILTER).strip().lower()
+    if filter_name not in SCALE_FILTER_CHOICES:
+        choices = ", ".join(SCALE_FILTER_CHOICES)
+        raise ValueError(f"unsupported scale filter {filter_name!r}; expected one of: {choices}")
+
+    asset_work_dir = unique_extract_dir(preview_root, source_path)
+    metadata = load_source_metadata(source_path, preview_root / "_source")
+    prepared = prepare_scaled_frames(
+        metadata,
+        sizes,
+        scale_filter=filter_name,
+        generated_dir=asset_work_dir,
+    )
+    localized = localize_metadata_frames(prepared, asset_work_dir)
+    available_nominal_sizes = sorted(
+        {int(frame.get("nominal_size", frame["width"])) for frame in localized["frames"]}
+    )
+    desired_size = (
+        int(preview_nominal_size)
+        if preview_nominal_size is not None
+        else choose_preview_nominal_size(available_nominal_sizes)
+    )
+    selected_nominal_size = min(available_nominal_sizes, key=lambda size: (abs(size - desired_size), size))
+    preview_frames = [
+        frame
+        for frame in localized["frames"]
+        if int(frame.get("nominal_size", frame["width"])) == selected_nominal_size
+    ]
+    if not preview_frames:
+        raise ValueError(f"no prepared frames available for preview size {selected_nominal_size}")
+
+    return {
+        "source": localized.get("source"),
+        "asset_type": localized.get("asset_type"),
+        "scale_filter": localized.get("scale_filter", filter_name),
+        "available_nominal_sizes": available_nominal_sizes,
+        "preview_nominal_size": selected_nominal_size,
+        "frames": preview_frames,
+    }
 
 
 def build_theme_from_mapping(

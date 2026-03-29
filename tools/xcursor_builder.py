@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -234,6 +235,21 @@ def find_image_tool() -> str:
     raise RuntimeError("ImageMagick is required but neither 'magick' nor 'convert' was found")
 
 
+def find_identify_command() -> list[str]:
+    for command in (["magick", "identify"], ["identify"]):
+        try:
+            subprocess.run(
+                command + ["-version"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return command
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    raise RuntimeError("ImageMagick identify is required but was not found")
+
+
 def ensure_clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -247,7 +263,58 @@ def scale_hotspot(value: int, old_size: int, new_size: int) -> int:
     return max(0, min(new_size - 1, scaled))
 
 
+def identify_png_size(source_png: Path) -> tuple[int, int]:
+    identify = find_identify_command()
+    result = subprocess.run(
+        identify + ["-format", "%w %h", str(source_png)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    width_str, height_str = result.stdout.strip().split()
+    return int(width_str), int(height_str)
+
+
+def normalize_entry(entry: dict, fallback_entry_index: int) -> dict:
+    if "png" not in entry:
+        raise ValueError("metadata entry is missing a png path")
+
+    width = int(entry["width"])
+    height = int(entry["height"])
+    if width <= 0 or height <= 0:
+        raise ValueError(f"metadata entry dimensions must be positive, got {width}x{height}")
+
+    hotspot_x = int(entry.get("hotspot_x", 0))
+    hotspot_y = int(entry.get("hotspot_y", 0))
+    if hotspot_x < 0 or hotspot_x >= width:
+        raise ValueError(f"metadata hotspot_x {hotspot_x} is outside entry width {width}")
+    if hotspot_y < 0 or hotspot_y >= height:
+        raise ValueError(f"metadata hotspot_y {hotspot_y} is outside entry height {height}")
+
+    normalized = {
+        "png": str(Path(entry["png"]).expanduser()),
+        "width": width,
+        "height": height,
+        "hotspot_x": hotspot_x,
+        "hotspot_y": hotspot_y,
+        "entry_index": int(entry.get("entry_index", entry.get("index", fallback_entry_index))),
+    }
+    if "colors" in entry and entry["colors"] is not None:
+        normalized["colors"] = int(entry["colors"])
+        if normalized["colors"] < 0:
+            raise ValueError("metadata colors must be non-negative")
+    if "image_size" in entry and entry["image_size"] is not None:
+        normalized["image_size"] = int(entry["image_size"])
+        if normalized["image_size"] < 0:
+            raise ValueError("metadata image_size must be non-negative")
+    return normalized
+
+
 def normalize_metadata(metadata: dict) -> dict:
+    raw_frames = metadata.get("frames", [])
+    if not isinstance(raw_frames, list):
+        raise ValueError("metadata frames must be a list")
+
     normalized = {
         "format_version": metadata.get("format_version", 1),
         "source": metadata.get("source"),
@@ -255,22 +322,29 @@ def normalize_metadata(metadata: dict) -> dict:
         "frames": [],
     }
 
-    for frame_index, frame in enumerate(metadata.get("frames", [])):
-        delay_ms = frame.get("delay_ms", 50)
+    for frame_index, frame in enumerate(raw_frames):
+        if not isinstance(frame, dict):
+            raise ValueError(f"frame {frame_index} must be an object")
+        delay_ms = int(frame.get("delay_ms", 50))
+        if delay_ms < 0:
+            raise ValueError(f"frame {frame_index} delay_ms must be non-negative")
         if "entries" in frame:
+            if not isinstance(frame["entries"], list):
+                raise ValueError(f"frame {frame_index} entries must be a list")
             entries = []
             for entry_index, entry in enumerate(frame["entries"], start=1):
-                entry_copy = dict(entry)
-                entry_copy.setdefault("entry_index", entry_copy.get("index", entry_index))
-                entries.append(entry_copy)
+                if not isinstance(entry, dict):
+                    raise ValueError(f"frame {frame_index} entry {entry_index} must be an object")
+                entries.append(normalize_entry(entry, entry_index))
         else:
-            entry_copy = dict(frame)
-            entry_copy.setdefault("entry_index", frame_index + 1)
-            entries = [entry_copy]
+            entries = [normalize_entry(frame, frame_index + 1)]
+
+        if not entries:
+            raise ValueError(f"frame {frame_index} contains no native entries")
 
         normalized["frames"].append(
             {
-                "frame_index": frame.get("frame_index", frame_index),
+                "frame_index": int(frame.get("frame_index", frame_index)),
                 "delay_ms": delay_ms,
                 "entries": entries,
             }
@@ -293,11 +367,38 @@ def choose_best_entry(entries: list[dict], target_size: int) -> dict:
     if not entries:
         raise ValueError("frame contains no native entries")
 
-    sorted_entries = sorted(entries, key=lambda item: (item["width"], item["height"], item.get("entry_index", 0)))
-    for entry in sorted_entries:
-        if entry["width"] >= target_size and entry["height"] >= target_size:
-            return entry
-    return sorted_entries[-1]
+    def color_rank(item: dict) -> int:
+        colors = int(item.get("colors", 0) or 0)
+        # In CUR headers a color count of 0 typically means >= 256 colors or truecolor.
+        return 1_000_000 if colors == 0 else colors
+
+    def image_size_rank(item: dict) -> int:
+        return int(item.get("image_size", 0) or 0)
+
+    def smallest_fit_key(item: dict) -> tuple[int, int, int, int, int]:
+        # Prefer the smallest native size that still satisfies the requested
+        # nominal cursor size, then rank equal-sized entries by richer payload.
+        return (
+            max(item["width"], item["height"]),
+            item["width"] * item["height"],
+            -image_size_rank(item),
+            -color_rank(item),
+            int(item.get("entry_index", 0)),
+        )
+
+    def largest_fallback_key(item: dict) -> tuple[int, int, int, int, int]:
+        return (
+            max(item["width"], item["height"]),
+            item["width"] * item["height"],
+            image_size_rank(item),
+            color_rank(item),
+            -int(item.get("entry_index", 0)),
+        )
+
+    fitting_entries = [entry for entry in entries if entry["width"] >= target_size and entry["height"] >= target_size]
+    if fitting_entries:
+        return min(fitting_entries, key=smallest_fit_key)
+    return max(entries, key=largest_fallback_key)
 
 
 def ensure_scaled_png(
@@ -308,7 +409,8 @@ def ensure_scaled_png(
 ) -> Path:
     generated_dir.mkdir(parents=True, exist_ok=True)
     safe_stem = sanitize_path_component(source_png.stem)
-    output_path = generated_dir / f"{safe_stem}_{scale_filter}_{target_size}.png"
+    digest = hashlib.sha256(str(source_png.expanduser().resolve()).encode("utf-8")).hexdigest()[:10]
+    output_path = generated_dir / f"{safe_stem}_{digest}_{scale_filter}_{target_size}.png"
     if output_path.exists():
         return output_path
 
@@ -346,19 +448,25 @@ def prepare_scaled_frames(
             else:
                 scaled_dir = cache_dir if cache_dir is not None else source_png.parent
                 output_png = ensure_scaled_png(source_png, scaled_dir, size, filter_name)
+            output_width, output_height = identify_png_size(output_png)
 
             build_frames["frames"].append(
                 {
                     "png": str(output_png),
                     "delay_ms": frame["delay_ms"],
-                    "width": size,
-                    "height": size,
-                    "hotspot_x": scale_hotspot(native_entry["hotspot_x"], native_entry["width"], size),
-                    "hotspot_y": scale_hotspot(native_entry["hotspot_y"], native_entry["height"], size),
+                    "width": output_width,
+                    "height": output_height,
+                    # Keep the requested cursor size as the Xcursor nominal size,
+                    # but preserve the emitted PNG dimensions and per-axis hotspot scaling.
+                    "nominal_size": size,
+                    "hotspot_x": scale_hotspot(native_entry["hotspot_x"], native_entry["width"], output_width),
+                    "hotspot_y": scale_hotspot(native_entry["hotspot_y"], native_entry["height"], output_height),
                     "frame_index": frame["frame_index"],
                     "entry_index": native_entry.get("entry_index"),
                     "native_width": native_entry["width"],
                     "native_height": native_entry["height"],
+                    "native_image_size": native_entry.get("image_size"),
+                    "native_colors": native_entry.get("colors"),
                 }
             )
 
@@ -366,11 +474,12 @@ def prepare_scaled_frames(
 
 
 def write_config(config_path: Path, metadata: dict) -> None:
-    lines = ["# size xhot yhot path delay"]
+    lines = ["# nominal_size xhot yhot path delay"]
     for frame in metadata["frames"]:
         frame_path = Path(frame["png"])
+        nominal_size = int(frame.get("nominal_size", frame["width"]))
         lines.append(
-            f"{frame['width']} {frame['hotspot_x']} {frame['hotspot_y']} {frame_path.name} {frame['delay_ms']}"
+            f"{nominal_size} {frame['hotspot_x']} {frame['hotspot_y']} {frame_path.name} {frame['delay_ms']}"
         )
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

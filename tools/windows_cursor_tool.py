@@ -13,6 +13,9 @@ import tempfile
 from pathlib import Path
 
 
+METADATA_FORMAT_VERSION = 2
+
+
 def sanitize_path_component(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     cleaned = cleaned.strip("._-")
@@ -137,7 +140,6 @@ def parse_ani_bytes(data: bytes) -> dict:
         icon_index = sequence[step_index] if step_index < len(sequence) else step_index
         icon_bytes = icons[icon_index]
         cur_info = parse_cur_bytes(icon_bytes)
-        entry = cur_info["entries"][0]
         delay_jiffies = rates[step_index]
         frame_entries.append(
             {
@@ -145,22 +147,27 @@ def parse_ani_bytes(data: bytes) -> dict:
                 "icon_index": icon_index,
                 "delay_jiffies": delay_jiffies,
                 "delay_ms": round(delay_jiffies * 1000 / 60),
-                "width": entry["width"],
-                "height": entry["height"],
-                "hotspot_x": entry["hotspot_x"],
-                "hotspot_y": entry["hotspot_y"],
+                "entries": [
+                    {
+                        "index": entry["index"],
+                        "width": entry["width"],
+                        "height": entry["height"],
+                        "hotspot_x": entry["hotspot_x"],
+                        "hotspot_y": entry["hotspot_y"],
+                    }
+                    for entry in cur_info["entries"]
+                ],
                 "cur_bytes": icon_bytes,
             }
         )
 
-    summary = {
+    return {
         "type": "ani",
         "anih": anih,
         "frames_embedded": len(icons),
         "steps": steps,
         "frame_entries": frame_entries,
     }
-    return summary
 
 
 def inspect_path(path: Path) -> dict:
@@ -173,19 +180,70 @@ def inspect_path(path: Path) -> dict:
     raise ValueError(f"unsupported file type: {path}")
 
 
-def extract_cur_to_png(cur_path: Path, output_png: Path) -> None:
+def _run_icotool_extract(cur_path: Path, entry_index: int, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["icotool", "-x", f"--index={entry_index}", "--output", str(output_dir), str(cur_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pngs = sorted(output_dir.glob("*.png"))
+    if not pngs:
+        raise RuntimeError(f"icotool did not produce a PNG for {cur_path} entry {entry_index}")
+    return pngs[0]
+
+
+def extract_cur_entry_to_png(cur_path: Path, entry_index: int, output_png: Path) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        subprocess.run(
-            ["icotool", "-x", "--index=1", "--output", tmpdir, str(cur_path)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        pngs = sorted(Path(tmpdir).glob("*.png"))
-        if not pngs:
-            raise RuntimeError(f"icotool did not produce a PNG for {cur_path}")
+        extracted = _run_icotool_extract(cur_path, entry_index, Path(tmpdir))
         output_png.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(pngs[0]), str(output_png))
+        shutil.move(str(extracted), str(output_png))
+
+
+def extract_cur_bytes_entry_to_png(cur_bytes: bytes, entry_index: int, output_png: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_cur = Path(tmpdir) / "frame.cur"
+        tmp_cur.write_bytes(cur_bytes)
+        extract_cur_entry_to_png(tmp_cur, entry_index, output_png)
+
+
+def _extract_entries(
+    entries: list[dict],
+    output_dir: Path,
+    safe_stem: str,
+    frame_tag: str,
+    delay_ms: int,
+    source_index_key: str = "entry_index",
+    cur_path: Path | None = None,
+    cur_bytes: bytes | None = None,
+) -> list[dict]:
+    extracted_entries = []
+    for entry in entries:
+        output_png = output_dir / (
+            f"{safe_stem}_{frame_tag}_e{entry['index']:02d}_{entry['width']}x{entry['height']}.png"
+        )
+        if cur_path is not None:
+            extract_cur_entry_to_png(cur_path, entry["index"], output_png)
+        elif cur_bytes is not None:
+            extract_cur_bytes_entry_to_png(cur_bytes, entry["index"], output_png)
+        else:
+            raise ValueError("either cur_path or cur_bytes must be provided")
+
+        extracted_entries.append(
+            {
+                "png": str(output_png),
+                "width": entry["width"],
+                "height": entry["height"],
+                "hotspot_x": entry["hotspot_x"],
+                "hotspot_y": entry["hotspot_y"],
+                source_index_key: entry["index"],
+                "delay_ms": delay_ms,
+            }
+        )
+
+    extracted_entries.sort(key=lambda item: (item["width"], item["height"], item[source_index_key]))
+    return extracted_entries
 
 
 def extract_asset(path: Path, output_dir: Path) -> dict:
@@ -193,40 +251,44 @@ def extract_asset(path: Path, output_dir: Path) -> dict:
     info = inspect_path(path)
     safe_stem = sanitize_path_component(path.stem)
     metadata = {
+        "format_version": METADATA_FORMAT_VERSION,
         "source": str(path),
         "asset_type": info["type"],
         "frames": [],
     }
 
     if info["type"] == "cur":
-        frame = info["entries"][0]
-        output_png = output_dir / f"{safe_stem}_000.png"
-        extract_cur_to_png(path, output_png)
+        frame_entries = _extract_entries(
+            info["entries"],
+            output_dir,
+            safe_stem,
+            "f000",
+            delay_ms=50,
+            cur_path=path,
+        )
         metadata["frames"].append(
             {
-                "png": str(output_png),
+                "frame_index": 0,
                 "delay_ms": 50,
-                "width": frame["width"],
-                "height": frame["height"],
-                "hotspot_x": frame["hotspot_x"],
-                "hotspot_y": frame["hotspot_y"],
+                "entries": frame_entries,
             }
         )
     else:
         for frame in info["frame_entries"]:
-            output_png = output_dir / f"{safe_stem}_{frame['step_index']:03d}.png"
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_cur = Path(tmpdir) / f"{safe_stem}_{frame['step_index']:03d}.cur"
-                tmp_cur.write_bytes(frame["cur_bytes"])
-                extract_cur_to_png(tmp_cur, output_png)
+            frame_entries = _extract_entries(
+                frame["entries"],
+                output_dir,
+                safe_stem,
+                f"f{frame['step_index']:03d}",
+                delay_ms=frame["delay_ms"],
+                cur_bytes=frame["cur_bytes"],
+            )
             metadata["frames"].append(
                 {
-                    "png": str(output_png),
+                    "frame_index": frame["step_index"],
+                    "icon_index": frame["icon_index"],
                     "delay_ms": frame["delay_ms"],
-                    "width": frame["width"],
-                    "height": frame["height"],
-                    "hotspot_x": frame["hotspot_x"],
-                    "hotspot_y": frame["hotspot_y"],
+                    "entries": frame_entries,
                 }
             )
 
@@ -243,7 +305,7 @@ def command_inspect(paths: list[Path]) -> int:
         if info["type"] == "ani":
             serializable = dict(info)
             serializable["frame_entries"] = [
-                {k: v for k, v in frame.items() if k != "cur_bytes"}
+                {key: value for key, value in frame.items() if key != "cur_bytes"}
                 for frame in info["frame_entries"]
             ]
             results[str(path)] = serializable
@@ -256,7 +318,7 @@ def command_inspect(paths: list[Path]) -> int:
 def command_extract(paths: list[Path], output_dir: Path) -> int:
     results = {}
     for path in paths:
-        results[str(path)] = extract_asset(path, output_dir / path.stem)
+        results[str(path)] = extract_asset(path, output_dir / sanitize_path_component(path.stem))
     print(json.dumps(results, indent=2))
     return 0
 

@@ -6,7 +6,9 @@ from __future__ import annotations
 import re
 
 
-DEFAULT_CURSOR_SIZES = [24, 32, 36, 48, 64]
+DEFAULT_CURSOR_SIZES = [24, 32, 36, 48, 64, 96, 128, 192]
+DEFAULT_SCALE_FILTER = "point"
+SCALE_FILTER_CHOICES = ("point", "mitchell", "lanczos")
 
 
 SLOT_DEFS = [

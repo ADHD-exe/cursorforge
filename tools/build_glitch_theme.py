@@ -10,7 +10,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from windows_cursor_tool import extract_asset
+from slot_definitions import DEFAULT_CURSOR_SIZES, DEFAULT_SCALE_FILTER, SCALE_FILTER_CHOICES
+from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
 VARIANTS = {
@@ -228,6 +229,12 @@ def find_image_tool() -> str:
     raise RuntimeError("ImageMagick is required but neither 'magick' nor 'convert' was found")
 
 
+def ensure_clean_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def scale_hotspot(value: int, old_size: int, new_size: int) -> int:
     if old_size <= 0:
         return value
@@ -235,38 +242,122 @@ def scale_hotspot(value: int, old_size: int, new_size: int) -> int:
     return max(0, min(new_size - 1, scaled))
 
 
-def prepare_scaled_frames(metadata: dict, target_sizes: list[int]) -> dict:
-    image_tool = find_image_tool()
-    scaled_metadata = {
-        "source": metadata["source"],
-        "asset_type": metadata["asset_type"],
+def normalize_metadata(metadata: dict) -> dict:
+    normalized = {
+        "format_version": metadata.get("format_version", 1),
+        "source": metadata.get("source"),
+        "asset_type": metadata.get("asset_type", "unknown"),
         "frames": [],
     }
 
-    for frame in metadata["frames"]:
-        src_path = Path(frame["png"])
-        for size in target_sizes:
-            if size == frame["width"]:
-                output_path = src_path
-            else:
-                output_path = src_path.with_name(f"{src_path.stem}_{size}.png")
-                subprocess.run(
-                    [image_tool, str(src_path), "-filter", "point", "-resize", f"{size}x{size}", str(output_path)],
-                    check=True,
-                )
+    for frame_index, frame in enumerate(metadata.get("frames", [])):
+        delay_ms = frame.get("delay_ms", 50)
+        if "entries" in frame:
+            entries = []
+            for entry_index, entry in enumerate(frame["entries"], start=1):
+                entry_copy = dict(entry)
+                entry_copy.setdefault("entry_index", entry_copy.get("index", entry_index))
+                entries.append(entry_copy)
+        else:
+            entry_copy = dict(frame)
+            entry_copy.setdefault("entry_index", frame_index + 1)
+            entries = [entry_copy]
 
-            scaled_metadata["frames"].append(
+        normalized["frames"].append(
+            {
+                "frame_index": frame.get("frame_index", frame_index),
+                "delay_ms": delay_ms,
+                "entries": entries,
+            }
+        )
+
+    if not normalized["frames"]:
+        raise ValueError("metadata contains no frames")
+    return normalized
+
+
+def validate_scale_filter(scale_filter: str) -> str:
+    filter_name = (scale_filter or DEFAULT_SCALE_FILTER).strip().lower()
+    if filter_name not in SCALE_FILTER_CHOICES:
+        choices = ", ".join(SCALE_FILTER_CHOICES)
+        raise ValueError(f"unsupported scale filter {scale_filter!r}; expected one of: {choices}")
+    return filter_name
+
+
+def choose_best_entry(entries: list[dict], target_size: int) -> dict:
+    if not entries:
+        raise ValueError("frame contains no native entries")
+
+    sorted_entries = sorted(entries, key=lambda item: (item["width"], item["height"], item.get("entry_index", 0)))
+    for entry in sorted_entries:
+        if entry["width"] >= target_size and entry["height"] >= target_size:
+            return entry
+    return sorted_entries[-1]
+
+
+def ensure_scaled_png(
+    source_png: Path,
+    generated_dir: Path,
+    target_size: int,
+    scale_filter: str,
+) -> Path:
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = sanitize_path_component(source_png.stem)
+    output_path = generated_dir / f"{safe_stem}_{scale_filter}_{target_size}.png"
+    if output_path.exists():
+        return output_path
+
+    image_tool = find_image_tool()
+    subprocess.run(
+        [image_tool, str(source_png), "-filter", scale_filter, "-resize", f"{target_size}x{target_size}", str(output_path)],
+        check=True,
+    )
+    return output_path
+
+
+def prepare_scaled_frames(
+    metadata: dict,
+    target_sizes: list[int],
+    scale_filter: str = DEFAULT_SCALE_FILTER,
+    generated_dir: Path | None = None,
+) -> dict:
+    normalized = normalize_metadata(metadata)
+    filter_name = validate_scale_filter(scale_filter)
+    build_frames = {
+        "source": normalized["source"],
+        "asset_type": normalized["asset_type"],
+        "scale_filter": filter_name,
+        "frames": [],
+    }
+
+    cache_dir = generated_dir if generated_dir is not None else None
+
+    for frame in normalized["frames"]:
+        for size in target_sizes:
+            native_entry = choose_best_entry(frame["entries"], size)
+            source_png = Path(native_entry["png"])
+            if native_entry["width"] == size and native_entry["height"] == size:
+                output_png = source_png
+            else:
+                scaled_dir = cache_dir if cache_dir is not None else source_png.parent
+                output_png = ensure_scaled_png(source_png, scaled_dir, size, filter_name)
+
+            build_frames["frames"].append(
                 {
-                    "png": str(output_path),
+                    "png": str(output_png),
                     "delay_ms": frame["delay_ms"],
                     "width": size,
                     "height": size,
-                    "hotspot_x": scale_hotspot(frame["hotspot_x"], frame["width"], size),
-                    "hotspot_y": scale_hotspot(frame["hotspot_y"], frame["height"], size),
+                    "hotspot_x": scale_hotspot(native_entry["hotspot_x"], native_entry["width"], size),
+                    "hotspot_y": scale_hotspot(native_entry["hotspot_y"], native_entry["height"], size),
+                    "frame_index": frame["frame_index"],
+                    "entry_index": native_entry.get("entry_index"),
+                    "native_width": native_entry["width"],
+                    "native_height": native_entry["height"],
                 }
             )
 
-    return scaled_metadata
+    return build_frames
 
 
 def write_config(config_path: Path, metadata: dict) -> None:
@@ -310,13 +401,13 @@ def write_theme_metadata(
     )
 
 
-def ensure_clean_dir(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def build_theme(source_dir: Path, build_root: Path, variant_name: str, target_sizes: list[int]) -> dict:
+def build_theme(
+    source_dir: Path,
+    build_root: Path,
+    variant_name: str,
+    target_sizes: list[int],
+    scale_filter: str = DEFAULT_SCALE_FILTER,
+) -> dict:
     variant_dir = build_root / f"variant-{variant_name}"
     extracted_dir = variant_dir / "extracted"
     configs_dir = variant_dir / "configs"
@@ -328,10 +419,12 @@ def build_theme(source_dir: Path, build_root: Path, variant_name: str, target_si
     configs_dir.mkdir(parents=True, exist_ok=True)
     cursors_dir.mkdir(parents=True, exist_ok=True)
 
+    filter_name = validate_scale_filter(scale_filter)
     asset_cache = {}
     manifest = {
         "variant": variant_name,
         "target_sizes": target_sizes,
+        "scale_filter": filter_name,
         "source_dir": str(source_dir),
         "built_assets": {},
         "theme_dir": str(theme_dir),
@@ -341,8 +434,14 @@ def build_theme(source_dir: Path, build_root: Path, variant_name: str, target_si
         asset_name = resolve_source(source_asset, variant_name)
         if asset_name not in asset_cache:
             asset_path = source_dir / asset_name
-            metadata = extract_asset(asset_path, extracted_dir / Path(asset_name).stem)
-            asset_cache[asset_name] = prepare_scaled_frames(metadata, target_sizes)
+            extracted_asset_dir = extracted_dir / sanitize_path_component(Path(asset_name).stem)
+            metadata = extract_asset(asset_path, extracted_asset_dir)
+            asset_cache[asset_name] = prepare_scaled_frames(
+                metadata,
+                target_sizes,
+                scale_filter=filter_name,
+                generated_dir=extracted_asset_dir,
+            )
         metadata = asset_cache[asset_name]
         role_frames_dir = Path(metadata["frames"][0]["png"]).parent
         config_path = configs_dir / f"{role_name}.conf"
@@ -374,11 +473,21 @@ def main() -> int:
     parser.add_argument("source_dir", type=Path)
     parser.add_argument("build_root", type=Path)
     parser.add_argument("--variant", choices=sorted(VARIANTS), default="v3")
-    parser.add_argument("--sizes", default="24,32,36,48,64", help="comma-separated cursor sizes to emit")
+    parser.add_argument(
+        "--sizes",
+        default=",".join(str(size) for size in DEFAULT_CURSOR_SIZES),
+        help="comma-separated cursor sizes to emit",
+    )
+    parser.add_argument(
+        "--scale-filter",
+        default=DEFAULT_SCALE_FILTER,
+        choices=SCALE_FILTER_CHOICES,
+        help="ImageMagick resize filter to use when scaling is required",
+    )
     args = parser.parse_args()
 
     sizes = sorted({int(part) for part in args.sizes.split(",") if part.strip()})
-    manifest = build_theme(args.source_dir, args.build_root, args.variant, sizes)
+    manifest = build_theme(args.source_dir, args.build_root, args.variant, sizes, scale_filter=args.scale_filter)
     print(json.dumps(manifest, indent=2))
     return 0
 

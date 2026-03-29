@@ -14,12 +14,13 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from slot_definitions import (
+    DEFAULT_CURSOR_SIZES,
+    DEFAULT_SCALE_FILTER,
     SLOT_BY_KEY,
     SLOT_DEFS,
     WINDOWS_ROLE_TO_SLOT,
     score_slot_match,
 )
-from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
 WINDOWS_CURSOR_EXTENSIONS = {".ani", ".cur", ".png"}
@@ -141,28 +142,11 @@ def choose_slot_assignments(source_dir: Path, cursor_files: list[Path]) -> tuple
     return chosen, diagnostics
 
 
-def write_slot_metadata_copy(slot_dir: Path, slot_key: str, metadata: dict) -> Path:
-    payload = {
-        "source": metadata["source"],
-        "asset_type": metadata["asset_type"],
-        "frames": [],
-    }
-    for frame in metadata["frames"]:
-        frame_path = Path(frame["png"])
-        try:
-            relative_png = frame_path.relative_to(slot_dir)
-        except ValueError:
-            relative_png = frame_path
-        frame_copy = dict(frame)
-        frame_copy["png"] = str(relative_png)
-        payload["frames"].append(frame_copy)
-
-    metadata_path = slot_dir / f"{slot_key}.json"
-    metadata_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return metadata_path
-
-
-def build_mapping_payload(selected_slots: dict[str, Path]) -> dict:
+def build_mapping_payload(
+    selected_slots: dict[str, Path],
+    target_sizes: list[int] | None = None,
+    scale_filter: str = DEFAULT_SCALE_FILTER,
+) -> dict:
     selected_payload = {}
     resolved = {}
     for slot_key, source_path in selected_slots.items():
@@ -175,6 +159,11 @@ def build_mapping_payload(selected_slots: dict[str, Path]) -> dict:
         for role in slot["roles"]:
             resolved[role] = str(source_path)
     return {
+        "mapping_format_version": 2,
+        "build_options": {
+            "target_sizes": list(target_sizes or DEFAULT_CURSOR_SIZES),
+            "scale_filter": scale_filter,
+        },
         "selected_slots": selected_payload,
         "resolved_role_map": resolved,
     }
@@ -192,21 +181,7 @@ def prepare_windows_cursor_set(source_dir: Path, output_dir: Path) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     chosen, diagnostics = choose_slot_assignments(source_dir, cursor_files)
-    slot_assets_dir = output_dir / "slot-assets"
-    slot_assets_dir.mkdir(parents=True, exist_ok=True)
-
-    selected_slots: dict[str, Path] = {}
-    extracted_assets = {}
-    for slot_key, source_path in sorted(chosen.items()):
-        slot_dir = slot_assets_dir / f"{slot_key}-{sanitize_path_component(source_path.stem)}"
-        metadata = extract_asset(source_path, slot_dir)
-        metadata_path = write_slot_metadata_copy(slot_dir, slot_key, metadata)
-        selected_slots[slot_key] = metadata_path.resolve()
-        extracted_assets[slot_key] = {
-            "source_file": str(source_path),
-            "metadata_json": str(metadata_path.resolve()),
-            "frame_count": len(metadata["frames"]),
-        }
+    selected_slots = {slot_key: source_path.resolve() for slot_key, source_path in sorted(chosen.items())}
 
     payload = build_mapping_payload(selected_slots)
     mapping_path = output_dir / "mapping.json"
@@ -220,7 +195,8 @@ def prepare_windows_cursor_set(source_dir: Path, output_dir: Path) -> dict:
         "mapping_json": str(mapping_path),
         "selected_slots": {key: str(path) for key, path in selected_slots.items()},
         "diagnostics": diagnostics,
-        "extracted_assets": extracted_assets,
+        "prepare_mode": "source-paths-only",
+        "build_options": payload["build_options"],
     }
     summary_path = output_dir / "prep-summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

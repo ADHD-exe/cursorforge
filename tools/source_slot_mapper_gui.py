@@ -19,15 +19,31 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from build_from_slot_mapping import build_theme_from_mapping
 from prepare_windows_cursor_set import prepare_windows_cursor_set
-from slot_definitions import DEFAULT_CURSOR_SIZES, SLOT_BY_KEY, SLOT_DEFS
+from slot_definitions import (
+    DEFAULT_CURSOR_SIZES,
+    DEFAULT_SCALE_FILTER,
+    SCALE_FILTER_CHOICES,
+    SLOT_BY_KEY,
+    SLOT_DEFS,
+)
 
 
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_WORK_ROOT = REPO_ROOT / "gui-builds"
 
 
-def build_payload(selected_slots: dict, resolved: dict) -> dict:
+def build_payload(
+    selected_slots: dict,
+    resolved: dict,
+    target_sizes: list[int] | None = None,
+    scale_filter: str = DEFAULT_SCALE_FILTER,
+) -> dict:
     return {
+        "mapping_format_version": 2,
+        "build_options": {
+            "target_sizes": list(target_sizes or DEFAULT_CURSOR_SIZES),
+            "scale_filter": scale_filter,
+        },
         "selected_slots": {
             item["slot"]["key"]: {
                 "label": item["slot"]["label"],
@@ -157,7 +173,6 @@ class SlotRow:
         self.clear_button.grid(row=row_index, column=4, pady=3)
 
     def browse(self):
-        allowed = [("Supported files", "*.ani *.cur *.png *.json")]
         patterns = " ".join(f"*{ext}" for ext in self.slot["allowed_extensions"])
         label = f"{self.slot['label']} files"
         allowed = [(label, patterns), ("All supported", "*.ani *.cur *.png *.json")]
@@ -191,8 +206,10 @@ class MappingApp:
         self.source_dir_var = tk.StringVar()
         self.work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
         self.theme_name_var = tk.StringVar(value="Custom-cursor")
+        self.scale_filter_var = tk.StringVar(value=DEFAULT_SCALE_FILTER)
         self.summary_var = tk.StringVar(value="0 source slots selected")
         self.status_var = tk.StringVar(value="Ready")
+        self.size_summary_var = tk.StringVar(value=", ".join(str(size) for size in DEFAULT_CURSOR_SIZES))
 
         outer = ttk.Frame(root, padding=12)
         outer.pack(fill="both", expand=True)
@@ -211,8 +228,8 @@ class MappingApp:
             outer,
             text=(
                 "Workflow: choose a Windows cursor folder, click Auto-Fill, adjust any of the 16 slots if needed, "
-                "then click Build + Package. The GUI will generate the mapping JSON, build the Linux Xcursor theme, "
-                "and create a .tar.gz installer."
+                "then click Build + Package. The builder keeps the original .cur/.ani sources until build time so it can "
+                "choose the best native image per Linux cursor size instead of flattening early."
             ),
             wraplength=1150,
             justify="left",
@@ -229,13 +246,13 @@ class MappingApp:
                 "1. Choose the Windows cursor folder.\n"
                 "2. Click Auto-Fill From Pack.\n"
                 "3. Fix any slot paths that look wrong.\n"
-                "4. Set the output root and theme name.\n"
+                "4. Confirm the scale filter and output root.\n"
                 "5. Click Build + Package.\n"
                 "6. Install the generated .tar.gz cursor theme."
             ),
             justify="left",
         )
-        steps.grid(row=0, column=4, rowspan=3, sticky="ne", padx=(14, 0))
+        steps.grid(row=0, column=4, rowspan=5, sticky="ne", padx=(14, 0))
 
         ttk.Label(workflow, text="Windows cursor folder").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(workflow, textvariable=self.source_dir_var).grid(row=0, column=1, sticky="ew", pady=3)
@@ -251,6 +268,18 @@ class MappingApp:
         ttk.Button(workflow, text="Build + Package", command=self.build_and_package).grid(
             row=2, column=3, padx=(8, 0), pady=3
         )
+
+        ttk.Label(workflow, text="Scale filter").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Combobox(
+            workflow,
+            textvariable=self.scale_filter_var,
+            values=SCALE_FILTER_CHOICES,
+            state="readonly",
+            width=18,
+        ).grid(row=3, column=1, sticky="w", pady=3)
+
+        ttk.Label(workflow, text="Output sizes").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Label(workflow, textvariable=self.size_summary_var).grid(row=4, column=1, sticky="w", pady=3)
 
         slot_frame = ttk.LabelFrame(outer, text="Source Slots", padding=10)
         slot_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
@@ -336,7 +365,18 @@ class MappingApp:
         self.clear_rows()
         selected = payload.get("selected_slots", {})
         role_map = payload.get("resolved_role_map", {})
+        build_options = payload.get("build_options", {})
         used_keys = set()
+
+        scale_filter = build_options.get("scale_filter")
+        if scale_filter in SCALE_FILTER_CHOICES:
+            self.scale_filter_var.set(scale_filter)
+
+        target_sizes = build_options.get("target_sizes")
+        if isinstance(target_sizes, list) and target_sizes:
+            self.size_summary_var.set(", ".join(str(int(size)) for size in target_sizes))
+        else:
+            self.size_summary_var.set(", ".join(str(size) for size in DEFAULT_CURSOR_SIZES))
 
         for slot_key, item in sorted(selected.items()):
             row = self.rows_by_key.get(slot_key)
@@ -400,6 +440,11 @@ class MappingApp:
         lines = [
             "# Cursor Source Slot Mapping",
             "",
+            "## Build Options",
+            "",
+            f"- Sizes: `{', '.join(str(size) for size in DEFAULT_CURSOR_SIZES)}`",
+            f"- Scale filter: `{self.scale_filter_var.get()}`",
+            "",
             "## Selected Source Slots",
             "",
         ]
@@ -449,7 +494,7 @@ class MappingApp:
             self.apply_payload(payload)
             self.current_mapping_path = Path(target).resolve()
             if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
-                self.theme_name_var.set(slugify_name(self.current_mapping_path.parent.name))
+                self.theme_name_var.set(slugify_name(Path(target).stem))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Unable to load mapping", str(exc))
             return
@@ -463,7 +508,12 @@ class MappingApp:
             messagebox.showerror("Invalid mapping", str(exc))
             return
 
-        payload = build_payload(selected_slots, resolved)
+        payload = build_payload(
+            selected_slots,
+            resolved,
+            DEFAULT_CURSOR_SIZES,
+            self.scale_filter_var.get(),
+        )
         target = filedialog.asksaveasfilename(
             title="Save role mapping as JSON",
             defaultextension=".json",
@@ -558,7 +608,12 @@ class MappingApp:
             return
         work_root.mkdir(parents=True, exist_ok=True)
 
-        payload = build_payload(selected_slots, resolved)
+        payload = build_payload(
+            selected_slots,
+            resolved,
+            DEFAULT_CURSOR_SIZES,
+            self.scale_filter_var.get(),
+        )
         build_root = work_root / "_builds" / safe_theme_name
         mapping_store_dir = work_root / "_mappings"
         mapping_path = mapping_store_dir / f"{safe_theme_name}.json"
@@ -584,7 +639,13 @@ class MappingApp:
             self.current_mapping_path = mapping_path
 
             self.set_status(f"Building Linux cursor theme: {safe_theme_name}")
-            manifest = build_theme_from_mapping(mapping_path, build_root, safe_theme_name, DEFAULT_CURSOR_SIZES)
+            manifest = build_theme_from_mapping(
+                mapping_path,
+                build_root,
+                safe_theme_name,
+                DEFAULT_CURSOR_SIZES,
+                scale_filter=self.scale_filter_var.get(),
+            )
             built_theme_dir = Path(manifest["theme_dir"]).resolve()
 
             self.set_status(f"Copying final theme to {final_theme_dir}")

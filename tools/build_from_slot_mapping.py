@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -23,13 +24,24 @@ from build_glitch_theme import (
     write_config,
     write_theme_metadata,
 )
-from slot_definitions import DEFAULT_CURSOR_SIZES
-from windows_cursor_tool import extract_asset
+from slot_definitions import DEFAULT_CURSOR_SIZES, DEFAULT_SCALE_FILTER, SCALE_FILTER_CHOICES
+from windows_cursor_tool import extract_asset, sanitize_path_component
+
+
+MAPPING_FORMAT_VERSION = 2
 
 
 def unique_extract_dir(base: Path, source_path: Path) -> Path:
     digest = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()[:8]
-    return base / f"{source_path.stem}-{digest}"
+    return base / f"{sanitize_path_component(source_path.stem)}-{digest}"
+
+
+def parse_size_list(raw_sizes: str | list[int] | None) -> list[int]:
+    if raw_sizes is None:
+        return list(DEFAULT_CURSOR_SIZES)
+    if isinstance(raw_sizes, list):
+        return sorted({int(size) for size in raw_sizes})
+    return sorted({int(part) for part in str(raw_sizes).split(",") if part.strip()})
 
 
 def load_mapping(mapping_path: Path) -> dict:
@@ -54,7 +66,7 @@ def find_identify_command() -> list[str]:
     raise RuntimeError("ImageMagick identify is required but was not found")
 
 
-def png_metadata(source_path: Path) -> dict:
+def identify_png_size(source_path: Path) -> tuple[int, int]:
     identify = find_identify_command()
     result = subprocess.run(
         identify + ["-format", "%w %h", str(source_path)],
@@ -63,37 +75,81 @@ def png_metadata(source_path: Path) -> dict:
         text=True,
     )
     width_str, height_str = result.stdout.strip().split()
-    width = int(width_str)
-    height = int(height_str)
+    return int(width_str), int(height_str)
+
+
+def png_metadata(source_path: Path) -> dict:
+    width, height = identify_png_size(source_path)
     return {
+        "format_version": 2,
         "source": str(source_path),
         "asset_type": "png",
         "frames": [
             {
-                "png": str(source_path),
+                "frame_index": 0,
                 "delay_ms": 50,
-                "width": width,
-                "height": height,
-                "hotspot_x": 0,
-                "hotspot_y": 0,
+                "entries": [
+                    {
+                        "png": str(source_path),
+                        "width": width,
+                        "height": height,
+                        "hotspot_x": 0,
+                        "hotspot_y": 0,
+                        "entry_index": 1,
+                    }
+                ],
             }
         ],
     }
 
 
+def resolve_png_entry(entry: dict, base_dir: Path, fallback_index: int) -> dict:
+    entry_copy = dict(entry)
+    png_path = Path(entry_copy["png"])
+    if not png_path.is_absolute():
+        png_path = (base_dir / png_path).resolve()
+    if not png_path.exists():
+        raise FileNotFoundError(f"metadata PNG does not exist: {png_path}")
+
+    width = entry_copy.get("width")
+    height = entry_copy.get("height")
+    if width is None or height is None:
+        width, height = identify_png_size(png_path)
+
+    entry_copy["png"] = str(png_path)
+    entry_copy["width"] = int(width)
+    entry_copy["height"] = int(height)
+    entry_copy["hotspot_x"] = int(entry_copy.get("hotspot_x", 0))
+    entry_copy["hotspot_y"] = int(entry_copy.get("hotspot_y", 0))
+    entry_copy["entry_index"] = int(entry_copy.get("entry_index", entry_copy.get("index", fallback_index)))
+    return entry_copy
+
+
 def metadata_from_json(source_path: Path) -> dict:
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     frames = []
-    for frame in payload.get("frames", []):
-        frame_path = Path(frame["png"])
-        if not frame_path.is_absolute():
-            frame_path = (source_path.parent / frame_path).resolve()
-        frame_copy = dict(frame)
-        frame_copy["png"] = str(frame_path)
-        frames.append(frame_copy)
+    for frame_index, frame in enumerate(payload.get("frames", [])):
+        delay_ms = int(frame.get("delay_ms", 50))
+        raw_entries = frame.get("entries") or [frame]
+        resolved_entries = [
+            resolve_png_entry(entry, source_path.parent, entry_index)
+            for entry_index, entry in enumerate(raw_entries, start=1)
+        ]
+        frames.append(
+            {
+                "frame_index": int(frame.get("frame_index", frame_index)),
+                "icon_index": frame.get("icon_index"),
+                "delay_ms": delay_ms,
+                "entries": sorted(
+                    resolved_entries,
+                    key=lambda item: (item["width"], item["height"], item["entry_index"]),
+                ),
+            }
+        )
     if not frames:
         raise ValueError(f"metadata JSON contains no frames: {source_path}")
     return {
+        "format_version": int(payload.get("format_version", 1)),
         "source": payload.get("source", str(source_path)),
         "asset_type": payload.get("asset_type", "json"),
         "frames": frames,
@@ -109,14 +165,58 @@ def load_source_metadata(source_path: Path, extracted_dir: Path) -> dict:
     return extract_asset(source_path, unique_extract_dir(extracted_dir, source_path))
 
 
+def localize_metadata_frames(metadata: dict, localized_dir: Path) -> dict:
+    localized_dir.mkdir(parents=True, exist_ok=True)
+    localized = {
+        "source": metadata.get("source"),
+        "asset_type": metadata.get("asset_type"),
+        "scale_filter": metadata.get("scale_filter", DEFAULT_SCALE_FILTER),
+        "frames": [],
+    }
+
+    for sequence_index, frame in enumerate(metadata.get("frames", [])):
+        source_png = Path(frame["png"]).expanduser().resolve()
+        suffix = source_png.suffix or ".png"
+        digest = hashlib.sha256(str(source_png).encode("utf-8")).hexdigest()[:8]
+        frame_index = int(frame.get("frame_index", sequence_index))
+        entry_index = int(frame.get("entry_index", 1) or 1)
+        target_name = (
+            f"f{frame_index:03d}_s{int(frame['width']):03d}_e{entry_index:02d}_"
+            f"{sanitize_path_component(source_png.stem)}_{digest}{suffix}"
+        )
+        target_path = localized_dir / target_name
+        if source_png != target_path and not target_path.exists():
+            shutil.copy2(source_png, target_path)
+        if source_png == target_path:
+            output_png = source_png
+        else:
+            output_png = target_path
+
+        frame_copy = dict(frame)
+        frame_copy["png"] = str(output_png)
+        localized["frames"].append(frame_copy)
+
+    if not localized["frames"]:
+        raise ValueError("localized metadata contains no frames")
+    return localized
+
+
 def build_theme_from_mapping(
     mapping_path: Path,
     output_root: Path,
     theme_name: str,
-    target_sizes: list[int],
+    target_sizes: list[int] | None = None,
+    scale_filter: str | None = None,
 ) -> dict:
     payload = load_mapping(mapping_path)
     role_map = payload["resolved_role_map"]
+    build_options = payload.get("build_options", {})
+
+    sizes = parse_size_list(target_sizes or build_options.get("target_sizes"))
+    filter_name = (scale_filter or build_options.get("scale_filter") or DEFAULT_SCALE_FILTER).strip().lower()
+    if filter_name not in SCALE_FILTER_CHOICES:
+        choices = ", ".join(SCALE_FILTER_CHOICES)
+        raise ValueError(f"unsupported scale filter {filter_name!r}; expected one of: {choices}")
 
     theme_dir = output_root / theme_name
     extracted_dir = output_root / "_extracted"
@@ -130,9 +230,11 @@ def build_theme_from_mapping(
 
     asset_cache = {}
     manifest = {
+        "mapping_format_version": MAPPING_FORMAT_VERSION,
         "theme_name": theme_name,
         "mapping_json": str(mapping_path),
-        "target_sizes": target_sizes,
+        "target_sizes": sizes,
+        "scale_filter": filter_name,
         "theme_dir": str(theme_dir),
         "built_assets": {},
     }
@@ -144,8 +246,15 @@ def build_theme_from_mapping(
 
         cache_key = str(source_path)
         if cache_key not in asset_cache:
+            asset_work_dir = unique_extract_dir(extracted_dir, source_path)
             metadata = load_source_metadata(source_path, extracted_dir)
-            asset_cache[cache_key] = prepare_scaled_frames(metadata, target_sizes)
+            prepared = prepare_scaled_frames(
+                metadata,
+                sizes,
+                scale_filter=filter_name,
+                generated_dir=asset_work_dir,
+            )
+            asset_cache[cache_key] = localize_metadata_frames(prepared, asset_work_dir)
 
         metadata = asset_cache[cache_key]
         frames_dir = Path(metadata["frames"][0]["png"]).parent
@@ -189,11 +298,24 @@ def main() -> int:
     parser.add_argument(
         "--sizes",
         default=",".join(str(size) for size in DEFAULT_CURSOR_SIZES),
+        help="comma-separated cursor sizes to emit",
+    )
+    parser.add_argument(
+        "--scale-filter",
+        default=DEFAULT_SCALE_FILTER,
+        choices=SCALE_FILTER_CHOICES,
+        help="ImageMagick resize filter to use when scaling is required",
     )
     args = parser.parse_args()
 
-    sizes = sorted({int(part) for part in args.sizes.split(",") if part.strip()})
-    manifest = build_theme_from_mapping(args.mapping_json, args.output_root, args.theme_name, sizes)
+    sizes = parse_size_list(args.sizes)
+    manifest = build_theme_from_mapping(
+        args.mapping_json,
+        args.output_root,
+        args.theme_name,
+        sizes,
+        scale_filter=args.scale_filter,
+    )
     print(json.dumps(manifest, indent=2))
     return 0
 

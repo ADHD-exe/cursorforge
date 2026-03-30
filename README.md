@@ -72,6 +72,26 @@ You can also use:
 python ./cursorforge-gui.py
 ```
 
+## Validation
+
+Run validation from the repo root:
+
+```bash
+python -m unittest -v
+```
+
+Explicit discovery still works too:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+For a fast syntax check across the main GUI/build modules:
+
+```bash
+python -m py_compile tools/source_slot_mapper_gui.py tools/gui_task_runner.py tools/prepare_windows_cursor_set.py tools/preview_cache.py
+```
+
 ## GUI Workflow
 
 The GUI now keeps long-running analysis, preview preparation, and build/export work off the Tk main thread.

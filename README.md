@@ -189,6 +189,8 @@ The stage also shows:
 - resolved Linux role map
 - final output paths after build
 
+By default the GUI uses `./_tmp/work` as its work root. You can change that folder, and the GUI will then keep its prepared mappings, preview cache, temporary build assets, final theme, and tarball under the selected work root.
+
 ## Animated Preview System
 
 The GUI now previews animation behavior instead of showing only a static thumbnail.
@@ -210,6 +212,7 @@ Preview cache behavior:
 - source metadata and predicted-output preview keys include the selected source path, the active work root, and the current preview settings
 - manual `.json` sources also include the referenced PNG dependency tokens, so editing a PNG refreshes both source and predicted-output previews even when the JSON file itself does not change
 - in-memory preview caches are bounded, and older on-disk preview artifacts are pruned gradually during long GUI sessions
+- CLI and GUI entrypoints pin low-level tempfile scratch data to `./_tmp`, but importing the Python modules does not override the process-wide temp directory
 
 The preview panels include:
 - play
@@ -281,13 +284,17 @@ The build stage also highlights:
 
 ## Output
 
-The GUI creates:
-- `_prepared/<pack-name>/mapping.json`
-- `_prepared/<pack-name>/prep-summary.json`
-- `_mappings/<theme-name>.json`
-- `_builds/<theme-name>/` temporary extracted and built assets
-- `<theme-name>/` built Linux cursor theme
-- `<theme-name>.tar.gz` installable cursor archive
+Given a selected GUI work root of `<work-root>`, the app creates:
+- `<work-root>/_prepared/<pack-name>/mapping.json`
+- `<work-root>/_prepared/<pack-name>/prep-summary.json`
+- `<work-root>/_mappings/<theme-name>.json`
+- `<work-root>/_builds/<theme-name>/` temporary extracted and built assets
+- `<work-root>/<theme-name>/` built Linux cursor theme
+- `<work-root>/<theme-name>.tar.gz` installable cursor archive
+
+The CLI helpers honor the output path you pass in:
+- `prepare-windows-cursor-set.py` writes its mapping and summary directly under the requested output directory
+- `build-cursor-from-mapping.py` writes the built theme under the requested output root and keeps its builder scratch data under `<output-root>/_cursorforge-build/<theme-name>/`
 
 ## Install A Built Theme
 
@@ -373,6 +380,7 @@ python ./prepare-windows-cursor-set.py /path/to/windows-pack /path/to/output-roo
 - output sizes: `24, 32, 36, 48, 64, 96, 128, 192`
 - scale filters: `point`, `mitchell`, `lanczos`
 - default filter: `point`
+- default GUI work root: `./_tmp/work`
 - `192` is included by default for HiDPI KDE workflows
 - `256` remains optional through presets or manual size entry
 

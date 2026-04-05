@@ -25,6 +25,7 @@ from slot_definitions import (
     normalize_cursor_sizes,
 )
 from windows_cursor_tool import inspect_path
+from workspace_paths import configure_project_tmp
 
 
 WINDOWS_CURSOR_EXTENSIONS = {".ani", ".cur", ".png"}
@@ -688,6 +689,7 @@ def prepare_windows_cursor_set(
 
 
 def main() -> int:
+    configure_project_tmp()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_dir", type=Path)
     parser.add_argument("output_dir", type=Path)

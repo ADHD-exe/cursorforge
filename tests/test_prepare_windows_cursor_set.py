@@ -121,7 +121,9 @@ class PrepareWindowsCursorSetTests(unittest.TestCase):
 
             self.assertEqual(analyze_cursor_pack.call_count, 1)
             self.assertEqual(summary["analysis"], analysis)
-            written_summary = json.loads((output_dir / "prep-summary.json").read_text(encoding="utf-8"))
+            actual_output_dir = Path(summary["output_dir"]).resolve()
+            self.assertEqual(actual_output_dir, output_dir.resolve())
+            written_summary = json.loads((actual_output_dir / "prep-summary.json").read_text(encoding="utf-8"))
             self.assertEqual(written_summary["analysis"], analysis)
             self.assertEqual(summary["selected_slots"]["default_pointer"], str(arrow.resolve()))
 

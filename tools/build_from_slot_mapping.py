@@ -40,6 +40,7 @@ from preview_cache import (
     source_cache_identity,
     touch_cache_path,
 )
+from workspace_paths import configure_project_tmp
 from windows_cursor_tool import extract_asset, sanitize_path_component
 
 
@@ -427,6 +428,7 @@ def build_theme_from_mapping(
 
 
 def main() -> int:
+    configure_project_tmp()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mapping_json", type=Path)
     parser.add_argument("output_root", type=Path)

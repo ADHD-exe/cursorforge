@@ -62,10 +62,13 @@ from slot_definitions import (
     score_slot_match,
 )
 from windows_cursor_tool import sanitize_path_component
+from workspace_paths import (
+    DEFAULT_PREVIEW_ROOT_NAME,
+    DEFAULT_WORK_ROOT,
+    REPO_ROOT,
+    configure_project_tmp,
+)
 
-
-REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_WORK_ROOT = REPO_ROOT / "gui-builds"
 DEFAULT_GUI_PALETTE_PATH = REPO_ROOT / "gui-palette.json"
 CARD_PREVIEW_SIZE = 48
 PLAYER_PREVIEW_SIZE = 132
@@ -3655,7 +3658,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
 
     def current_preview_root(self) -> Path:
         work_root = normalize_path(Path(self.work_root_var.get().strip() or DEFAULT_WORK_ROOT))
-        return work_root / "_preview-cache"
+        return work_root / DEFAULT_PREVIEW_ROOT_NAME
 
     def preview_photo(self, png_path: Path, box_size: int) -> tk.PhotoImage:
         preview_root = self.current_preview_root()
@@ -4002,8 +4005,9 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
             self.current_mapping_path = mapping_path
             if self.theme_name_var.get().strip() in {"", "Custom-cursor"}:
                 self.theme_name_var.set(slugify_name(source_dir.name))
-            self.notebook.select(self.review_tab)
-            self.set_status(f"Auto-filled {summary['selected_slot_count']} source slots")
+            self.set_status(
+                f"Auto-filled {summary['selected_slot_count']} slots; review them in the next tab when ready"
+            )
             messagebox.showinfo(
                 "Auto-Fill Complete",
                 f"Prepared {summary['selected_slot_count']} slots.\n\nMapping JSON:\n{mapping_path}",
@@ -5031,6 +5035,7 @@ if {![llength [info commands ::tk::dialog::file::SetPath__cursorforge_orig]]} {
 
 
 def main(argv: list[str] | None = None) -> None:
+    configure_project_tmp()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--load", type=Path, help="preload a mapping JSON into the GUI")
     parser.add_argument("--palette", type=Path, help="load a GUI palette JSON; defaults to gui-palette.json when present")
